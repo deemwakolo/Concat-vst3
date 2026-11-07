@@ -1650,12 +1650,23 @@ fn decode(
                                 continue;
                             }
                             let params = state.effect.params_at(at);
-                            if let Err(error) = state.plugin.set_parameters_by_name(&params) {
-                                log::warn!(
-                                    "Could not apply VST3 parameter values for {}: {error}; bypassing it",
-                                    state.effect.class_id
-                                );
-                                state.failed = true;
+                            for (name, value) in &params {
+                                let count = state.plugin.num_parameters().unwrap_or(0);
+                                for index in 0..count {
+                                    if let Ok(info) = state.plugin.parameter_info(index)
+                                        && info.name == *name
+                                    {
+                                        if let Err(error) = state.plugin.set_parameter(info.id, *value) {
+                                            log::warn!(
+                                                "Could not apply VST3 parameter value {name} for {}: {error}; bypassing it",
+                                                state.effect.class_id
+                                            );
+                                            state.failed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if state.failed {
                                 continue;
                             }
                             let dry = block.clone();
