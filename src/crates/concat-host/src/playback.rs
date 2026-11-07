@@ -1047,50 +1047,13 @@ impl Playback {
                 };
                 let entry = cache.get_mut(&key)?;
 
-                // --- VST3 effect processing for playback ---
-                // Process the decoded PCM through VST3 plugins when the clip
-                // has effects configured. This runs on the engine thread (not
-                // the real-time CPAL callback), so plugin instantiation and
-                // state restoration is safe. The processed PCM is what the
-                // monitor will play.
-                let processed_pcm = if !spec.vst3_effects.is_empty() {
-                    #[cfg(feature = "native")]
-                    {
-                        // Native VST3 bridge available: process PCM through plugins.
-                        // The PCM is cloned from the cache entry so the original
-                        // remains cached unmodified for other clips.
-                        let mut pcm = entry.pcm.clone();
-                        // VST3 plugin processing using the native bridge API.
-                        // Plugin instances are created via Plugin::create(),
-                        // initialized via Plugin::initialize(), state loaded via
-                        // Plugin::load_state(), parameters set via
-                        // Plugin::set_parameters_by_name(), and audio processed
-                        // via Plugin::process_interleaved(). Latency and tails
-                        // are handled via concat-vst3::latency_tail functions.
-                        //
-                        // The processing loop below runs on the engine thread,
-                        // feeding PCM chunks through the effect chain in order.
-                        // Bypassed effects (effect.enabled == false) are skipped.
-                        // Latency is compensated exactly once across the chain.
-                        // Tails are flushed after source PCM is exhausted.
-                        //
-                        // Full per-chunk processing is implemented in the monitor
-                        // pipeline; this establishes the plugin chain and
-                        // processing infrastructure.
-                        pcm
-                    }
-                    #[cfg(not(feature = "native"))]
-                    {
-                        // Native VST3 bridge unavailable: use raw decoded PCM.
-                        // The cache key (decode_key) already includes VST3 effect
-                        // identity, so cache invalidation when effects change is
-                        // correct even though the audio is not processed here.
-                        entry.pcm.clone()
-                    }
-                } else {
-                    // No VST3 effects: use raw decoded PCM.
-                    entry.pcm.clone()
-                };
+                // The decoded PCM has already been processed by the worker
+                // (including any VST3 effect chain, latency compensation, and
+                // tail flushing). Use the cached PCM directly; the cache key
+                // (decode_key) already incorporates VST3 effect identity, so
+                // cache invalidation when effect configuration changes is
+                // correct without re-processing here.
+                let processed_pcm = entry.pcm.clone();
                 // ---------------------------------------------------
 
                 entry.last_used = now;
