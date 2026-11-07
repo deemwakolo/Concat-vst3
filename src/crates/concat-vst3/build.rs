@@ -3,12 +3,11 @@
 
 //! Build script for concat-vst3.
 //!
-//! When the `native` feature is enabled and `VST3_SDK_DIR` points at an
-//! unpacked Steinberg VST3 SDK, this compiles the C++ host bridge
-//! (`src/bridge.cpp`) into a static library and tells Cargo to link it.
-//! Otherwise the crate compiles to a stub: every plugin lookup reports
-//! unavailable, and the crate still builds on machines without the SDK or a
-//! C++ compiler.
+//! When the `native` feature is enabled, this compiles the C++ host bridge
+//! (`src/bridge.cpp`) against the Steinberg VST3 SDK and links it into the
+//! crate. The `native` feature is intentionally optional: with it disabled,
+//! `concat-vst3` builds as a stub and does not require the SDK or a C++
+//! compiler.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -20,48 +19,47 @@ fn main() {
         return;
     }
 
-    // Cargo does not track this by default. Without it, toggling the SDK path
-    // can leave a cached stub-only build script result in place.
     println!("cargo:rerun-if-env-changed=VST3_SDK_DIR");
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=CXX");
+    println!("cargo:rerun-if-env-changed=PATH");
 
     let sdk_dir = match env::var("VST3_SDK_DIR") {
         Ok(dir) => PathBuf::from(dir),
         Err(_) => {
-            println!(
-                "cargo:warning=concat-vst3: native feature enabled but VST3_SDK_DIR is not set; \
-                 building stub-only"
+            panic!(
+                "concat-vst3: native feature enabled but VST3_SDK_DIR is not set; \
+                 set it to an unpacked Steinberg VST3 SDK"
             );
-            return;
         }
     };
 
     if !sdk_dir.is_dir() {
-        println!(
-            "cargo:warning=concat-vst3: VST3_SDK_DIR {:?} is not a directory; building stub-only",
+        panic!(
+            "concat-vst3: VST3_SDK_DIR {:?} is not a directory",
             sdk_dir
         );
-        return;
     }
-
-    let compiler = match find_cpp_compiler() {
-        Some(c) => c,
-        None => {
-            println!(
-                "cargo:warning=concat-vst3: no C++ compiler found; building stub-only"
-            );
-            return;
-        }
-    };
 
     let pluginterfaces = sdk_dir.join("pluginterfaces");
     let base_dir = sdk_dir.join("base").join("source");
 
     if !pluginterfaces.is_dir() {
-        println!(
-            "cargo:warning=concat-vst3: VST3_SDK_DIR lacks pluginterfaces/; building stub-only"
+        panic!(
+            "concat-vst3: VST3_SDK_DIR {:?} lacks pluginterfaces/",
+            sdk_dir
         );
-        return;
     }
+
+    // Let cc-rs perform the actual compiler discovery. Its logic is more
+    // reliable than shelling out to `where`, especially for MSVC environments
+    // initialized by vcvars64.bat, and it validates that the selected compiler
+    // can target the requested Rust target.
+    let compiler = cc::Build::new()
+        .try_get_compiler()
+        .unwrap_or_else(|error| {
+            panic!("concat-vst3: native feature enabled but no C++ compiler found: {error}")
+        });
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let bridge_cpp = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("bridge.cpp");
@@ -72,7 +70,7 @@ fn main() {
     let mut cpp_build = cc::Build::new();
     cpp_build
         .cpp(true)
-        .compiler(compiler)
+        .compiler(compiler.path())
         .file(&bridge_cpp)
         // The SDK headers refer to each other as "pluginterfaces/base/...",
         // so both the SDK root and the base header directory must be on the
@@ -86,6 +84,7 @@ fn main() {
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         cpp_build.flag("/EHsc");
+        cpp_build.define("NOMINMAX", None);
     }
 
     cpp_build.compile("concat_vst3_bridge");
@@ -95,39 +94,4 @@ fn main() {
         "cargo:rustc-link-search=native={}",
         out_dir.display()
     );
-}
-
-fn find_cpp_compiler() -> Option<String> {
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        which("cl.exe").ok()
-    } else {
-        for name in ["clang++", "g++", "c++"] {
-            if let Ok(path) = which(name) {
-                return Some(path);
-            }
-        }
-        None
-    }
-}
-
-fn which(name: &str) -> std::io::Result<String> {
-    let output = std::process::Command::new("where").arg(name).output()?;
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout);
-        return text
-            .lines()
-            .next()
-            .filter(|l| !l.is_empty())
-            .map(|s| s.to_string())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("{name} not found on PATH"),
-                )
-            });
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("{name} not found on PATH"),
-    ))
 }

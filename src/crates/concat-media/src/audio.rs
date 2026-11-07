@@ -1339,7 +1339,7 @@ fn mix_pcm_with_vst3_buses(
         source,
     })?;
     let mut base_bytes = 0u64;
-    mix_pcm(&prepared_clips, &[], from, to, |bytes| {
+    mix_pcm_impl(&prepared_clips, &[], from, to, &mut |bytes| {
         base_bytes = base_bytes.saturating_add(bytes.len() as u64);
         if base_bytes > u64::from(u32::MAX - 36) {
             return Err(Error::Probe {
@@ -1399,6 +1399,16 @@ fn mix_pcm_with_vst3_buses(
         write(&decoder.bytes_of(&frame))?;
     }
     Ok(())
+}
+
+pub fn mix_pcm(
+    clips: &[AudioClip],
+    buses: &[AudioBus],
+    from: f64,
+    to: f64,
+    mut write: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    mix_pcm_impl(clips, buses, from, to, &mut write)
 }
 
 /// Mixes `clips` into one audio file at `destination`: 16-bit PCM for a
@@ -1637,12 +1647,18 @@ pub fn mix_to_file_with(
 /// span is mixed here, once, the way the export mixes it. A clip a window
 /// cuts into keeps its own clock (see `Heard`), so the window's sound is
 /// the export's sound over the same stretch.
-pub fn mix_pcm(
+/// Type-erased core of [`mix_pcm`].
+///
+/// `mix_pcm_with_vst3_buses` needs to call back into `mix_pcm` for the
+/// prepared base mix. Keeping that call on this non-generic function breaks
+/// the recursive closure monomorphization that previously exceeded Rust's
+/// instantiation limit.
+fn mix_pcm_impl(
     clips: &[AudioClip],
     buses: &[AudioBus],
     from: f64,
     to: f64,
-    mut write: impl FnMut(&[u8]) -> Result<()>,
+    write: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
     #[cfg(feature = "vst3")]
     if buses

@@ -10,6 +10,10 @@
 // The bridge owns the VST3 C++ objects (IComponent, IEditController,
 // IAudioProcessor). Rust holds an opaque handle and calls through this ABI.
 
+#if defined(_WIN32)
+#define NOMINMAX
+#endif
+
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/base/ipluginbase.h"

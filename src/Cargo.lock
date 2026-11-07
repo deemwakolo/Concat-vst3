@@ -1173,6 +1173,7 @@ dependencies = [
  "concat-speech",
  "concat-text",
  "concat-vision",
+ "concat-vst3",
  "dirs",
  "image",
  "libc",
@@ -1314,6 +1315,7 @@ version = "0.2.9"
 dependencies = [
  "concat-core",
  "concat-project",
+ "concat-vst3",
  "ffmpeg-the-third",
  "libc",
  "log",
