@@ -446,15 +446,30 @@ impl Studio {
                         audio: false,
                     })
                     .collect(),
-                clip.filters
-                    .iter()
-                    .enumerate()
-                    .map(|(index, filter)| EffectData {
-                        id: index as i32 + 1000,
-                        name: label_of(&filter.id).into(),
-                        audio: true,
-                    })
-                    .collect(),
+                {
+                    let mut audio = clip
+                        .filters
+                        .iter()
+                        .enumerate()
+                        .map(|(index, filter)| EffectData {
+                            id: index as i32 + 1000,
+                            name: label_of(&filter.id).into(),
+                            audio: true,
+                        })
+                        .collect::<Vec<_>>();
+                    for (index, effect) in clip.vst3_effects.iter().enumerate() {
+                        audio.push(EffectData {
+                            id: (clip.filters.len() + index) as i32 + 1000,
+                            name: effect
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| effect.class_id.clone())
+                                .into(),
+                            audio: true,
+                        });
+                    }
+                    audio
+                },
             ),
             None => (Vec::new(), Vec::new()),
         };
@@ -467,7 +482,40 @@ impl Studio {
             match self.sole_selection().and_then(|id| self.clip(&id)) {
                 Some(clip) => {
                     let (visual, visual_params) = chain_rows(&clip.video_effects);
-                    let (sound, sound_params) = chain_rows(&clip.filters);
+                    let (mut sound, mut sound_params) = chain_rows(&clip.filters);
+                    for (index, effect) in clip.vst3_effects.iter().enumerate() {
+                        let entry = clip.filters.len() as i32 + index as i32;
+                        sound.push(AppliedEntryData {
+                            id: vst3_id(&effect.class_id).into(),
+                            name: effect
+                                .name
+                                .clone()
+                                .unwrap_or_else(|| effect.class_id.clone())
+                                .into(),
+                            on: effect.enabled,
+                            known: true,
+                        });
+                        for (key, value) in &effect.params {
+                            sound_params.push(AppliedParamData {
+                                entry,
+                                key: key.as_str().into(),
+                                label: key.as_str().into(),
+                                group: "".into(),
+                                unit: "".into(),
+                                min: 0.0,
+                                max: 1.0,
+                                step: 0.01,
+                                default_value: 0.0,
+                                value: *value as f32,
+                                fmt: ParamFormat::Plain,
+                                keyable: false,
+                                keyed: false,
+                                here: false,
+                                prev: false,
+                                next: false,
+                            });
+                        }
+                    }
                     (visual, visual_params, sound, sound_params)
                 }
                 None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),

@@ -10,6 +10,7 @@ description = "Rendering a timeline to a file, and one true frame of it to a mon
 # The GPU compositor is the only one now, so it is always built; the
 # feature is kept so the crates that name it need not change.
 gpu = []
+vst3 = ["concat-media/vst3"]
 
 [dependencies]
 concat-core.workspace = true

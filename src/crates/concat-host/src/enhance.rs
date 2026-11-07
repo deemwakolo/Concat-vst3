@@ -531,6 +531,9 @@ fn footage(
                     fade_in: 0.0,
                     fade_out: 0.0,
                     filter_chain: String::new(),
+                    vst3_effects: Vec::new(),
+                    automation_start: 0.0,
+                    automation_span: 1.0,
                 };
                 let muxed = concat_media::audio::mix_to_file(&[clip], duration, &partial_audio)
                     .and_then(|()| {

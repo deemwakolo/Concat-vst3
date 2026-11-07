@@ -1573,7 +1573,7 @@ impl Studio {
             );
             sync(&models.effect_groups, groups);
             sync(&models.catalogue_effects, entries);
-            let (groups, entries) = shelves(
+            let (mut groups, mut entries) = shelves(
                 SHELF_KINDS[2],
                 &self.library[2],
                 starred,
@@ -1581,6 +1581,24 @@ impl Studio {
                 &self.card_paths,
                 |_| true,
             );
+            if !vst3_catalogue().is_empty() {
+                let group = groups.iter().position(|held| held.as_str() == "VST3");
+                if group.is_none() {
+                    groups.push(SharedString::from("VST3"));
+                }
+                let group = groups.iter().position(|held| held.as_str() == "VST3").unwrap() as i32;
+                for desc in vst3_catalogue() {
+                    entries.push(CatalogueEntryData {
+                        id: vst3_id(&desc.class_id).into(),
+                        name: desc.name.into(),
+                        category: "VST3".into(),
+                        group,
+                        description: format!("{} · {}", desc.vendor, desc.name).into(),
+                        favourite: false,
+                        art: slint::Image::default(),
+                    });
+                }
+            }
             sync(&models.audio_groups, groups);
             sync(&models.catalogue_audio, entries);
             let (groups, entries) = shelves(

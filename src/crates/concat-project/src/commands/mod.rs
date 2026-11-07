@@ -145,6 +145,8 @@ pub struct ClipPatch {
     pub filters: Option<Vec<AppliedFilter>>,
     /// Wholesale replacement of the video effect chain, like `filters`.
     pub video_effects: Option<Vec<AppliedFilter>>,
+    /// Wholesale replacement of the VST3 effect chain, like `filters`.
+    pub vst3_effects: Option<Vec<crate::model::Vst3Effect>>,
     /// The transition on the cut into the clip: absent leaves it alone,
     /// null clears it, a value replaces it.
     #[serde(
@@ -1211,6 +1213,15 @@ impl Command {
                     || patch.shape.iter().any(|style| bad(style.numbers()))
                     || patch.filters.as_deref().is_some_and(bad_chain)
                     || patch.video_effects.as_deref().is_some_and(bad_chain)
+                    || patch.vst3_effects.as_deref().is_some_and(|effects| {
+                        effects.iter().any(|effect| {
+                            effect.class_id.is_empty()
+                                || effect.params.values().any(|value| !value.is_finite())
+                                || effect.keys.values().flatten().any(|key| {
+                                    !key.at.is_finite() || !key.value.is_finite()
+                                })
+                        })
+                    })
                     || patch
                         .transition_in
                         .iter()

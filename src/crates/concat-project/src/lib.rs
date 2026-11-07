@@ -5563,6 +5563,30 @@ mod tests {
     }
 
     #[test]
+    fn vst3_effect_keys_ride_a_knob() {
+        use crate::model::{KeyEase, Vst3Effect};
+
+        let mut effect = Vst3Effect::new("1234567890abcdef1234567890abcdef");
+        effect.params.insert("gain".to_owned(), 1.0);
+        effect.set_key("gain", 0.0, -1.0, KeyEase::LINEAR);
+        effect.set_key("gain", 0.5, 0.0, KeyEase::LINEAR);
+        effect.set_key("gain", 1.0, 1.0, KeyEase::LINEAR);
+
+        assert!(effect.is_keyed("gain"));
+        assert!((effect.value_at("gain", 0.5, 0.0)).abs() < 1e-9);
+        assert_eq!(effect.params_at(0.25).get("gain").copied(), Some(-0.5));
+        assert_eq!(effect.params_at(0.75).get("gain").copied(), Some(0.5));
+        assert_eq!(effect.keys_around("gain", 0.5), (Some(0.0), Some(1.0)));
+        assert!(effect.key_at("gain", 1.0).is_some());
+
+        effect.clear_key("gain", 1.0);
+        assert!(effect.is_keyed("gain"));
+        effect.clear_keys("gain");
+        assert!(!effect.is_keyed("gain"));
+        assert_eq!(effect.value_at("gain", 0.5, 0.0), 1.0);
+    }
+
+    #[test]
     fn missing_media_detects_nonexistent_paths() {
         let mut project = Project::new();
 

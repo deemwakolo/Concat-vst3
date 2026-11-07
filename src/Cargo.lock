@@ -1280,6 +1280,7 @@ dependencies = [
  "concat-render",
  "concat-text",
  "concat-vision",
+ "concat-vst3",
  "cpal",
  "libc",
  "log",
@@ -1312,6 +1313,7 @@ name = "concat-media"
 version = "0.2.9"
 dependencies = [
  "concat-core",
+ "concat-project",
  "ffmpeg-the-third",
  "libc",
  "log",
@@ -1422,6 +1424,18 @@ dependencies = [
  "concat-project",
  "ort",
  "png 0.17.16",
+]
+
+[[package]]
+name = "concat-vst3"
+version = "0.2.9"
+dependencies = [
+ "cc",
+ "concat-core",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

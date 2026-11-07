@@ -163,6 +163,9 @@ pub struct ExportClip {
     /// shader runs on the GPU. A link no package answers to draws nothing.
     #[serde(default)]
     pub effects: Vec<AppliedFilter>,
+    /// VST3 audio effects for this clip, in order.
+    #[serde(default)]
+    pub vst3_effects: Vec<concat_project::model::Vst3Effect>,
     /// The fades to a colour and the wipes transition resolution gives the
     /// clip, which the frame plan draws; see [`TransitionShape`].
     #[serde(skip)]
@@ -359,6 +362,7 @@ impl ExportClip {
             blend: String::new(),
             crop: None,
             effects: Vec::new(),
+            vst3_effects: Vec::new(),
             transition_shapes: Vec::new(),
             scale: 1.0,
             offset_x: 0.0,
@@ -1091,6 +1095,7 @@ pub fn render_on(
     });
 
     let (timeline_end, total_frames) = timeline_extent(&resolved, rate, request.effect_time_offset);
+    let buses = audio_buses(&resolved);
     if total_frames <= 0 {
         return Err("the timeline is empty".to_owned());
     }
@@ -1137,19 +1142,29 @@ pub fn render_on(
             &mut reporter,
         )?;
 
-        let finished = if sound.is_empty() {
+        let finished = if sound.is_empty() && buses.is_empty() {
             &silent
         } else {
             reporter.cancelled()?;
             reporter.emit(0, total_frames, "mixing audio");
+            let has_vst3 = sound
+                .iter()
+                .any(|clip| clip.vst3_effects.iter().any(|effect| effect.enabled))
+                || buses
+                    .iter()
+                    .any(|bus| bus.vst3_effects.iter().any(|effect| effect.enabled));
             let mix: Vec<AudioClip> = sound.iter().flat_map(|clip| audio_pieces(clip)).collect();
-            let buses = audio_buses(&resolved);
             audio::mix_to_file_with(&mix, &buses, timeline_end.as_f64(), &mixed)
                 .map_err(|error| error.to_string())?;
 
             reporter.cancelled()?;
             reporter.emit(total_frames, total_frames, "muxing");
-            audio::mux(&silent, &mixed, &muxed).map_err(|error| error.to_string())?;
+            if has_vst3 {
+                audio::mux_with_audio_tail(&silent, &mixed, &muxed)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                audio::mux(&silent, &mixed, &muxed).map_err(|error| error.to_string())?;
+            }
             &muxed
         };
         std::fs::rename(finished, &output)
@@ -1256,6 +1271,7 @@ pub fn audio_buses(clips: &[ExportClip]) -> Vec<audio::AudioBus> {
             start: clip.start,
             duration: clip.duration,
             filter_chain: clip.filter_chain.clone(),
+            vst3_effects: clip.vst3_effects.clone(),
             strength: clip.opacity.clamp(0.0, 1.0),
             fade_in: clip.fade_in,
             fade_out: clip.fade_out,
@@ -1285,6 +1301,9 @@ pub fn audio_pieces(clip: &ExportClip) -> Vec<AudioClip> {
             fade_in: clip.fade_in,
             fade_out: clip.fade_out,
             filter_chain: chain,
+            vst3_effects: clip.vst3_effects.clone(),
+            automation_start: 0.0,
+            automation_span: 1.0,
         }];
     };
     // Pieces a tenth of a second long, or eight at least: fine enough that
@@ -1316,6 +1335,9 @@ pub fn audio_pieces(clip: &ExportClip) -> Vec<AudioClip> {
                 fade_in: if clip.fade_in > 0.0 { fade_in } else { 0.0 },
                 fade_out: if clip.fade_out > 0.0 { fade_out } else { 0.0 },
                 filter_chain: chain.clone(),
+                vst3_effects: clip.vst3_effects.clone(),
+                automation_start: x0,
+                automation_span: x1 - x0,
             }
         })
         .collect()
@@ -3268,6 +3290,59 @@ mod tests {
             path: format!("{kind}.mp4"),
             source_start,
             ..ExportClip::blank(kind_of, start, duration, track)
+        }
+    }
+
+    #[test]
+    fn vst3_effect_configuration_reaches_the_export_audio_clip() {
+        let mut audio = clip("audio", 0, 0.0, 2.0, 0.0);
+        let mut effect =
+            concat_project::model::Vst3Effect::new("0123456789abcdef0123456789abcdef");
+        effect.name = Some("Test effect".to_owned());
+        effect.params.insert("Mix".to_owned(), 0.4);
+        effect.enabled = false;
+        audio.vst3_effects.push(effect.clone());
+
+        let pieces = audio_pieces(&audio);
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].vst3_effects, vec![effect]);
+    }
+
+    #[test]
+    fn sound_layer_vst3_configuration_reaches_the_export_bus() {
+        let mut layer = clip("layer", 0, 0.0, 2.0, 0.0);
+        layer.kind = ClipKind::SoundLayer;
+        let mut effect =
+            concat_project::model::Vst3Effect::new("0123456789abcdef0123456789abcdef");
+        effect.state = Some(vec![8, 9]);
+        layer.vst3_effects.push(effect.clone());
+        let buses = audio_buses(&[layer]);
+        assert_eq!(buses.len(), 1);
+        assert_eq!(buses[0].vst3_effects, vec![effect]);
+    }
+
+    #[test]
+    fn retimed_export_pieces_keep_the_original_vst3_automation_clock() {
+        let mut audio = clip("audio", 0, 0.0, 2.0, 0.0);
+        audio.speed_curve = vec![(0.0, 1.0), (1.0, 2.0)];
+        audio.vst3_effects.push(concat_project::model::Vst3Effect::new(
+            "0123456789abcdef0123456789abcdef",
+        ));
+
+        let pieces = audio_pieces(&audio);
+        assert!(pieces.len() > 1);
+        assert_eq!(pieces.first().unwrap().automation_start, 0.0);
+        let last = pieces.last().unwrap();
+        assert!(
+            (last.automation_start + last.automation_span - 1.0).abs() < 1e-9
+        );
+        for pair in pieces.windows(2) {
+            assert!(
+                (pair[0].automation_start + pair[0].automation_span
+                    - pair[1].automation_start)
+                    .abs()
+                    < 1e-9
+            );
         }
     }
 

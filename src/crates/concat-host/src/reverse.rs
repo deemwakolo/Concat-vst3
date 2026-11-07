@@ -161,6 +161,9 @@ fn span_clip(request: &ReverseRequest, chain: &str) -> AudioClip {
         fade_in: 0.0,
         fade_out: 0.0,
         filter_chain: chain.to_owned(),
+        vst3_effects: Vec::new(),
+        automation_start: 0.0,
+        automation_span: 1.0,
     }
 }
 

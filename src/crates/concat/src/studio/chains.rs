@@ -82,6 +82,47 @@ impl Studio {
     }
 
     pub fn chain_add(&mut self, audio: bool, id: &str) {
+        if audio {
+            if let Some(class_id) = vst3_class_id(id) {
+                let ids = self.edit_targets();
+                let mut commands = Vec::new();
+                for clip_id in &ids {
+                    let Some(clip) = self.clip(clip_id) else {
+                        continue;
+                    };
+                    let mut effects = clip.vst3_effects.clone();
+                    let mut entry = model::Vst3Effect::new(class_id);
+                    if let Some((name, vendor)) = vst3_catalogue()
+                        .into_iter()
+                        .find(|desc| desc.class_id == class_id)
+                        .map(|desc| (desc.name, desc.vendor))
+                    {
+                        entry.name = Some(name);
+                        entry.vendor = Some(vendor);
+                    }
+                    effects.push(entry);
+                    commands.push(Command::UpdateClip {
+                        clip_id: clip_id.clone(),
+                        patch: ClipPatch {
+                            vst3_effects: Some(effects),
+                            ..ClipPatch::default()
+                        },
+                    });
+                }
+                let command = match commands.len() {
+                    0 => return,
+                    1 => commands.remove(0),
+                    _ => Command::Batch { commands },
+                };
+                self.apply(command);
+                self.inspector_jump = (
+                    self.inspector_jump.0 + 1,
+                    "Audio",
+                    "AudioEffects",
+                );
+                return;
+            }
+        }
         // Added from the chain in view: stay there, unlike a library card (#462).
         let jump = self.inspector_jump;
         self.apply_catalogue(id, !audio);
@@ -89,6 +130,51 @@ impl Studio {
     }
 
     pub fn chain_toggle(&mut self, audio: bool, index: i32) {
+        if audio {
+            let ids = self.edit_targets();
+            let Some(first) = ids.first().and_then(|id| self.clip(id)) else {
+                return;
+            };
+            let offset = first.filters.len() as i32;
+            if index >= offset {
+                let row = (index - offset) as usize;
+                let on = ids
+                    .first()
+                    .and_then(|id| self.clip(id))
+                    .and_then(|clip| clip.vst3_effects.get(row))
+                    .is_some_and(|effect| !effect.enabled);
+                let mut commands = Vec::new();
+                for clip_id in &ids {
+                    let Some(clip) = self.clip(clip_id) else {
+                        continue;
+                    };
+                    let Some(effect) = clip.vst3_effects.get(row).cloned() else {
+                        continue;
+                    };
+                    let mut effects = clip.vst3_effects.clone();
+                    if let Some(entry) = effects.get_mut(row) {
+                        let changed = entry.enabled != on;
+                        entry.enabled = on;
+                        if changed {
+                            commands.push(Command::UpdateClip {
+                                clip_id: clip_id.clone(),
+                                patch: ClipPatch {
+                                    vst3_effects: Some(effects),
+                                    ..ClipPatch::default()
+                                },
+                            });
+                        }
+                    }
+                }
+                let command = match commands.len() {
+                    0 => return,
+                    1 => commands.remove(0),
+                    _ => Command::Batch { commands },
+                };
+                self.apply(command);
+                return;
+            }
+        }
         // The link shown sets the state for all of a batch, so a batch
         // whose links disagree comes out agreeing rather than flipped.
         let on = self
@@ -116,6 +202,41 @@ impl Studio {
         if delta == 0 {
             return;
         }
+        if audio {
+            let ids = self.edit_targets();
+            let Some(first) = ids.first().and_then(|id| self.clip(id)) else {
+                return;
+            };
+            let offset = first.filters.len() as i32;
+            if index >= offset {
+                let row = (index - offset) as usize;
+                let mut commands = Vec::new();
+                for clip_id in &ids {
+                    let Some(clip) = self.clip(clip_id) else {
+                        continue;
+                    };
+                    let mut effects = clip.vst3_effects.clone();
+                    let target = (row as i32 + delta) as i32;
+                    if row < effects.len() && target >= 0 && target as usize < effects.len() {
+                        effects.swap(row, target as usize);
+                        commands.push(Command::UpdateClip {
+                            clip_id: clip_id.clone(),
+                            patch: ClipPatch {
+                                vst3_effects: Some(effects),
+                                ..ClipPatch::default()
+                            },
+                        });
+                    }
+                }
+                let command = match commands.len() {
+                    0 => return,
+                    1 => commands.remove(0),
+                    _ => Command::Batch { commands },
+                };
+                self.apply(command);
+                return;
+            }
+        }
         self.chain_edit(audio, &[index, index + delta], |chain, at| {
             chain.swap(at[0], at[1]);
             true
@@ -123,6 +244,40 @@ impl Studio {
     }
 
     pub fn chain_remove(&mut self, audio: bool, index: i32) {
+        if audio {
+            let ids = self.edit_targets();
+            let Some(first) = ids.first().and_then(|id| self.clip(id)) else {
+                return;
+            };
+            let offset = first.filters.len() as i32;
+            if index >= offset {
+                let row = (index - offset) as usize;
+                let mut commands = Vec::new();
+                for clip_id in &ids {
+                    let Some(clip) = self.clip(clip_id) else {
+                        continue;
+                    };
+                    let mut effects = clip.vst3_effects.clone();
+                    if row < effects.len() {
+                        effects.remove(row);
+                        commands.push(Command::UpdateClip {
+                            clip_id: clip_id.clone(),
+                            patch: ClipPatch {
+                                vst3_effects: Some(effects),
+                                ..ClipPatch::default()
+                            },
+                        });
+                    }
+                }
+                let command = match commands.len() {
+                    0 => return,
+                    1 => commands.remove(0),
+                    _ => Command::Batch { commands },
+                };
+                self.apply(command);
+                return;
+            }
+        }
         self.chain_edit(audio, &[index], |chain, at| {
             chain.remove(at[0]);
             true
@@ -131,6 +286,40 @@ impl Studio {
 
     /// One knob of one link, on the echo. `clip_commit` makes it real.
     pub fn chain_set_param(&mut self, audio: bool, index: i32, key: &str, value: f32) {
+        if audio {
+            let ids = self.edit_targets();
+            let Some(first) = ids.first().and_then(|id| self.clip(id)) else {
+                return;
+            };
+            let offset = first.filters.len() as i32;
+            if index >= offset {
+                let row = (index - offset) as usize;
+                let mut commands = Vec::new();
+                for clip_id in &ids {
+                    let Some(clip) = self.clip(clip_id) else {
+                        continue;
+                    };
+                    let mut effects = clip.vst3_effects.clone();
+                    if row < effects.len() {
+                        effects[row].params.insert(key.to_owned(), value as f64);
+                        commands.push(Command::UpdateClip {
+                            clip_id: clip_id.clone(),
+                            patch: ClipPatch {
+                                vst3_effects: Some(effects),
+                                ..ClipPatch::default()
+                            },
+                        });
+                    }
+                }
+                let command = match commands.len() {
+                    0 => return,
+                    1 => commands.remove(0),
+                    _ => Command::Batch { commands },
+                };
+                self.apply(command);
+                return;
+            }
+        }
         self.edit_links(audio, index, |link, _| {
             link.params.insert(key.to_owned(), f64::from(value));
         });

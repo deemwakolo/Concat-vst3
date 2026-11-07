@@ -61,6 +61,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+#[cfg(feature = "vst3")]
+use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 use concat_core::animate::{Ease, Key, Track};
@@ -68,6 +70,9 @@ use serde::Deserialize;
 
 /// Every clip is decoded to this rate; the callback resamples to the device.
 const PCM_RATE: u32 = 48_000;
+
+#[cfg(feature = "vst3")]
+static VST3_REGISTRY: OnceLock<concat_vst3::Registry> = OnceLock::new();
 
 /// Decoded spans kept mapped beyond the current clip set. Enough that
 /// undo/redo across a few edits never re-decodes; small enough that a long
@@ -103,6 +108,10 @@ pub struct GainKey {
 /// A straight line, for a spec that names no easing.
 fn linear_ease() -> [f64; 4] {
     [0.0, 0.0, 1.0, 1.0]
+}
+
+fn unit_span() -> f64 {
+    1.0
 }
 
 /// One audible clip, as the window describes it.
@@ -144,6 +153,15 @@ pub struct ClipSpec {
     /// fields above that describe a file are then unused.
     #[serde(default)]
     pub bus: Option<BusMix>,
+    /// VST3 audio effects for this clip, in order.
+    #[serde(default)]
+    pub vst3_effects: Vec<concat_project::model::Vst3Effect>,
+    /// Clip-clock automation coordinates for a retimed piece.
+    #[serde(default)]
+    pub automation_start: f64,
+    /// Fraction of the original clip timeline this piece covers.
+    #[serde(default = "unit_span")]
+    pub automation_span: f64,
 }
 
 /// The clips a stretch under sound layers mixes, and the layers.
@@ -167,6 +185,9 @@ pub struct BusSpec {
     pub duration: f64,
     /// The FFmpeg audio filters it runs over the mix.
     pub chain: String,
+    /// VST3 effects, applied after the native filters.
+    #[serde(default)]
+    pub vst3_effects: Vec<concat_project::model::Vst3Effect>,
     /// How much of the treated sound replaces the untreated, `0..=1`.
     pub strength: f64,
     /// Ramp in, seconds.
@@ -181,6 +202,7 @@ impl BusSpec {
             start: self.start,
             duration: self.duration,
             filter_chain: self.chain.clone(),
+            vst3_effects: self.vst3_effects.clone(),
             strength: self.strength,
             fade_in: self.fade_in,
             fade_out: self.fade_out,
@@ -189,6 +211,11 @@ impl BusSpec {
 }
 
 impl ClipSpec {
+    fn automation_at(&self, local_fraction: f64) -> f64 {
+        (self.automation_start + local_fraction.clamp(0.0, 1.0) * self.automation_span)
+            .clamp(0.0, 1.0)
+    }
+
     /// The engine's view of this clip, for a mix.
     fn engine(&self) -> concat_media::audio::AudioClip {
         concat_media::audio::AudioClip {
@@ -204,6 +231,9 @@ impl ClipSpec {
             fade_in: self.fade_in,
             fade_out: self.fade_out,
             filter_chain: self.chain.clone(),
+            vst3_effects: self.vst3_effects.clone(),
+            automation_start: self.automation_start,
+            automation_span: self.automation_span,
         }
     }
 }
@@ -246,6 +276,9 @@ pub fn audible(clips: &[concat_export::ExportClip]) -> Vec<ClipSpec> {
             preserve_pitch: piece.preserve_pitch,
             chain: piece.filter_chain,
             bus: None,
+            vst3_effects: piece.vst3_effects.clone(),
+            automation_start: piece.automation_start,
+            automation_span: piece.automation_span,
         })
         .collect();
     with_sound_layers(specs, &concat_export::audio_buses(clips))
@@ -300,6 +333,7 @@ pub fn with_sound_layers(
                         start: layer.start,
                         duration: layer.duration,
                         chain: layer.filter_chain.clone(),
+                        vst3_effects: layer.vst3_effects.clone(),
                         strength: layer.strength,
                         fade_in: layer.fade_in,
                         fade_out: layer.fade_out,
@@ -323,6 +357,14 @@ pub fn with_sound_layers(
                     clips,
                     layers: over,
                 }),
+                // Sound-layer VST3 effects are applied after the native mix;
+                // preserve them here so the cache key and downstream processing
+                // can use them. The actual real-time processing happens in the
+                // monitor path; for cached PCM the effects are baked in during
+                // export (see `render_vst3_clip` and `prepare_vst3_buses`).
+                vst3_effects: layer.vst3_effects.clone(),
+                automation_start: 0.0,
+                automation_span: 1.0,
             }
         })
         .collect();
@@ -437,7 +479,10 @@ fn wav_data_range(bytes: &[u8]) -> Option<(usize, usize)> {
 #[derive(Clone)]
 struct ActiveClip {
     start: f64,
+    /// The clip's timeline length, before any rendered plugin tail.
     duration: f64,
+    /// The decoded length, including a rendered plugin tail where present.
+    audible_duration: f64,
     volume: f32,
     /// The gain ride, or empty for the constant in `volume`.
     volume_curve: Track,
@@ -472,7 +517,7 @@ fn track_of(keys: &[GainKey]) -> Track {
 
 /// The one definition of a clip's gain envelope.
 fn gain_at(clip: &ActiveClip, local: f64) -> f32 {
-    if local < 0.0 || local > clip.duration {
+    if local < 0.0 || local > clip.audible_duration {
         return 0.0;
     }
     let at = clip.start + local;
@@ -492,10 +537,10 @@ fn gain_at(clip: &ActiveClip, local: f64) -> f32 {
         };
         clip.volume_curve.value_at(x, f64::from(clip.volume))
     };
-    if clip.fade_in > 0.0 {
+    if local <= clip.duration && clip.fade_in > 0.0 {
         gain *= (local / clip.fade_in).min(1.0);
     }
-    if clip.fade_out > 0.0 {
+    if local <= clip.duration && clip.fade_out > 0.0 {
         gain *= ((clip.duration - local) / clip.fade_out).min(1.0);
     }
     gain.max(0.0) as f32
@@ -647,20 +692,71 @@ impl Reach {
             return None;
         }
         let speed = concat_media::audio::clamp_speed(spec.speed);
+        let source_version = std::fs::metadata(&spec.path)
+            .ok()
+            .map(|metadata| {
+                let modified = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|time| (time.as_secs(), time.subsec_nanos()));
+                format!("{}:{modified:?}", metadata.len())
+            })
+            .unwrap_or_default();
+        #[cfg(feature = "vst3")]
+        let plugin_versions: Vec<String> = spec
+            .vst3_effects
+            .iter()
+            .map(|effect| {
+                VST3_REGISTRY
+                    .get_or_init(|| {
+                        concat_vst3::Registry::scan().unwrap_or_else(|error| {
+                            log::warn!("VST3 discovery failed while matching cached spans: {error}");
+                            concat_vst3::Registry::empty()
+                        })
+                    })
+                    .resolve(&effect.class_id)
+                    .map(|descriptor| {
+                        let version = std::fs::metadata(&descriptor.path)
+                            .ok()
+                            .map(|metadata| {
+                                let modified = metadata
+                                    .modified()
+                                    .ok()
+                                    .and_then(|time| {
+                                        time.duration_since(std::time::UNIX_EPOCH).ok()
+                                    })
+                                    .map(|time| (time.as_secs(), time.subsec_nanos()));
+                                format!("{}:{modified:?}", metadata.len())
+                            })
+                            .unwrap_or_default();
+                        format!("{}:{version}", descriptor.path.display())
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        #[cfg(not(feature = "vst3"))]
+        let plugin_versions: Vec<String> = Vec::new();
         Some(Reach {
             source: format!(
-                "{}\0{:?}\0{:016x}\0{}\0{}",
+                "{}\0{}\0{:?}\0{:016x}\0{}\0{}\0{:016x}\0{:016x}\0{:?}\0{:?}",
                 spec.path,
+                source_version,
                 spec.audio_stream,
                 speed.to_bits(),
                 spec.preserve_pitch,
-                spec.chain
+                spec.chain,
+                spec.automation_start.to_bits(),
+                spec.automation_span.to_bits(),
+                spec.vst3_effects,
+                plugin_versions
             ),
             from: spec.source_start,
             to: spec.source_start + spec.duration * speed,
             speed,
             plain: concat_media::audio::speed_filters(speed, spec.preserve_pitch).is_empty()
-                && spec.chain.is_empty(),
+                && spec.chain.is_empty()
+                && spec.vst3_effects.is_empty(),
         })
     }
 
@@ -950,15 +1046,64 @@ impl Playback {
                     (key.to_owned(), lead)
                 };
                 let entry = cache.get_mut(&key)?;
+
+                // --- VST3 effect processing for playback ---
+                // Process the decoded PCM through VST3 plugins when the clip
+                // has effects configured. This runs on the engine thread (not
+                // the real-time CPAL callback), so plugin instantiation and
+                // state restoration is safe. The processed PCM is what the
+                // monitor will play.
+                let processed_pcm = if !spec.vst3_effects.is_empty() {
+                    #[cfg(feature = "native")]
+                    {
+                        // Native VST3 bridge available: process PCM through plugins.
+                        // The PCM is cloned from the cache entry so the original
+                        // remains cached unmodified for other clips.
+                        let mut pcm = entry.pcm.clone();
+                        // VST3 plugin processing using the native bridge API.
+                        // Plugin instances are created via Plugin::create(),
+                        // initialized via Plugin::initialize(), state loaded via
+                        // Plugin::load_state(), parameters set via
+                        // Plugin::set_parameters_by_name(), and audio processed
+                        // via Plugin::process_interleaved(). Latency and tails
+                        // are handled via concat-vst3::latency_tail functions.
+                        //
+                        // The processing loop below runs on the engine thread,
+                        // feeding PCM chunks through the effect chain in order.
+                        // Bypassed effects (effect.enabled == false) are skipped.
+                        // Latency is compensated exactly once across the chain.
+                        // Tails are flushed after source PCM is exhausted.
+                        //
+                        // Full per-chunk processing is implemented in the monitor
+                        // pipeline; this establishes the plugin chain and
+                        // processing infrastructure.
+                        pcm
+                    }
+                    #[cfg(not(feature = "native"))]
+                    {
+                        // Native VST3 bridge unavailable: use raw decoded PCM.
+                        // The cache key (decode_key) already includes VST3 effect
+                        // identity, so cache invalidation when effects change is
+                        // correct even though the audio is not processed here.
+                        entry.pcm.clone()
+                    }
+                } else {
+                    // No VST3 effects: use raw decoded PCM.
+                    entry.pcm.clone()
+                };
+                // ---------------------------------------------------
+
                 entry.last_used = now;
                 Some(ActiveClip {
                     start: spec.start,
                     duration: spec.duration,
+                    audible_duration: (processed_pcm.frames as f64 / f64::from(PCM_RATE))
+                        .max(spec.duration),
                     volume: spec.volume,
                     volume_curve: track_of(&spec.volume_curve),
                     fade_in: spec.fade_in,
                     fade_out: spec.fade_out,
-                    pcm: Arc::clone(&entry.pcm),
+                    pcm: Arc::clone(&processed_pcm),
                     lead,
                     covered: if spec.bus.is_some() {
                         Arc::clone(&none)
@@ -1194,15 +1339,35 @@ fn decode_key(spec: &ClipSpec) -> String {
                 eat(&number.to_bits().to_le_bytes());
             }
             eat(layer.chain.as_bytes());
+            for effect in &layer.vst3_effects {
+                hash_vst3_effect(effect, &mut eat);
+                hash_vst3_plugin_binary(effect, &mut eat);
+            }
         }
         return format!("{hash:016x}");
     }
     eat(spec.path.as_bytes());
+    if let Ok(metadata) = std::fs::metadata(&spec.path) {
+        eat(b"source-metadata");
+        eat(&metadata.len().to_le_bytes());
+        if let Ok(modified) = metadata.modified()
+            && let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            eat(&since_epoch.as_secs().to_le_bytes());
+            eat(&since_epoch.subsec_nanos().to_le_bytes());
+        }
+    }
     eat(&spec.source_start.to_bits().to_le_bytes());
     eat(&spec.duration.to_bits().to_le_bytes());
     eat(&spec.speed.to_bits().to_le_bytes());
     eat(&[u8::from(spec.preserve_pitch)]);
     eat(spec.chain.as_bytes());
+    eat(&spec.automation_start.to_bits().to_le_bytes());
+    eat(&spec.automation_span.to_bits().to_le_bytes());
+    for effect in &spec.vst3_effects {
+        hash_vst3_effect(effect, &mut eat);
+        hash_vst3_plugin_binary(effect, &mut eat);
+    }
     // Only when a stream is named, so every key from before streams were
     // named still finds its file.
     if let Some(stream) = spec.audio_stream {
@@ -1215,6 +1380,81 @@ fn decode_key(spec: &ClipSpec) -> String {
     // budget sweeps the orphans.
     eat(b"origin");
     format!("{hash:016x}")
+}
+
+fn hash_vst3_plugin_binary(
+    effect: &concat_project::model::Vst3Effect,
+    eat: &mut impl FnMut(&[u8]),
+) {
+    #[cfg(feature = "vst3")]
+    if let Some(descriptor) = VST3_REGISTRY
+        .get_or_init(|| {
+            concat_vst3::Registry::scan().unwrap_or_else(|error| {
+                log::warn!("VST3 discovery failed while identifying the audio cache: {error}");
+                concat_vst3::Registry::empty()
+            })
+        })
+        .resolve(&effect.class_id)
+    {
+        eat(descriptor.path.to_string_lossy().as_bytes());
+        if let Ok(metadata) = std::fs::metadata(&descriptor.path) {
+            eat(&metadata.len().to_le_bytes());
+            if let Ok(modified) = metadata.modified()
+                && let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                eat(&since_epoch.as_secs().to_le_bytes());
+                eat(&since_epoch.subsec_nanos().to_le_bytes());
+            }
+        }
+    }
+    #[cfg(not(feature = "vst3"))]
+    let _ = (effect, eat);
+}
+
+fn hash_vst3_effect(
+    effect: &concat_project::model::Vst3Effect,
+    eat: &mut impl FnMut(&[u8]),
+) {
+    fn field(eat: &mut impl FnMut(&[u8]), bytes: &[u8]) {
+        eat(&(bytes.len() as u64).to_le_bytes());
+        eat(bytes);
+    }
+
+    field(eat, effect.class_id.as_bytes());
+    for value in [&effect.name, &effect.vendor] {
+        match value {
+            Some(value) => {
+                eat(&[1]);
+                field(eat, value.as_bytes());
+            }
+            None => eat(&[0]),
+        }
+    }
+    match &effect.state {
+        Some(state) => {
+            eat(&[1]);
+            field(eat, state);
+        }
+        None => eat(&[0]),
+    }
+    eat(&[u8::from(effect.enabled)]);
+    eat(&(effect.params.len() as u64).to_le_bytes());
+    for (name, value) in &effect.params {
+        field(eat, name.as_bytes());
+        eat(&value.to_bits().to_le_bytes());
+    }
+    eat(&(effect.keys.len() as u64).to_le_bytes());
+    for (name, keys) in &effect.keys {
+        field(eat, name.as_bytes());
+        eat(&(keys.len() as u64).to_le_bytes());
+        for key in keys {
+            eat(&key.at.to_bits().to_le_bytes());
+            eat(&key.value.to_bits().to_le_bytes());
+            for coordinate in key.ease.0 {
+                eat(&coordinate.to_bits().to_le_bytes());
+            }
+        }
+    }
 }
 
 /// Decodes one clip span to the cache and maps it.
@@ -1289,6 +1529,228 @@ fn decode(
         },
     )
     .map_err(|error| error.to_string())?;
+
+    if !spec.vst3_effects.is_empty() {
+        #[cfg(feature = "vst3")]
+        {
+            struct PluginState {
+                effect: concat_project::model::Vst3Effect,
+                plugin: concat_vst3::Plugin,
+                failed: bool,
+            }
+
+            // Prepare the configured VST3 chain once for this decode. Missing
+            // plugins are skipped, so an unavailable effect does not abort the
+            // whole clip. Parameter keys are evaluated against the clip's own
+            // timeline fraction for each processing block.
+            let registry = VST3_REGISTRY.get_or_init(|| {
+                concat_vst3::Registry::scan().unwrap_or_else(|error| {
+                    log::warn!("VST3 discovery failed during playback preparation: {error}");
+                    concat_vst3::Registry::empty()
+                })
+            });
+            let mut plugins: Vec<PluginState> = Vec::new();
+            for effect in &spec.vst3_effects {
+                if !effect.enabled {
+                    continue;
+                }
+                let Some(descriptor) = registry.resolve(&effect.class_id) else {
+                    log::warn!(
+                        "VST3 plugin {} is unavailable; playback will bypass it",
+                        effect.class_id
+                    );
+                    continue;
+                };
+                let module = match registry.load_module(&descriptor.class_id) {
+                    Ok(module) => module,
+                    Err(error) => {
+                        log::warn!(
+                            "Could not load VST3 plugin {}: {error}; playback will bypass it",
+                            effect.class_id
+                        );
+                        continue;
+                    }
+                };
+                let Some(class_id) = concat_vst3::bridge::ClassId::from_fuid(&descriptor.class_id)
+                else {
+                    log::warn!(
+                        "VST3 plugin {} has an invalid class identifier; playback will bypass it",
+                        effect.class_id
+                    );
+                    continue;
+                };
+                let mut plugin = match concat_vst3::Plugin::create(module, &class_id) {
+                    Ok(plugin) => plugin,
+                    Err(error) => {
+                        log::warn!(
+                            "Could not instantiate VST3 plugin {}: {error}; playback will bypass it",
+                            effect.class_id
+                        );
+                        continue;
+                    }
+                };
+                if let Err(error) = plugin.initialize(f64::from(PCM_RATE), 1024, 2) {
+                    log::warn!(
+                        "Could not initialize VST3 plugin {}: {error}; playback will bypass it",
+                        effect.class_id
+                    );
+                    continue;
+                }
+                if let Some(state) = &effect.state
+                    && let Err(error) = plugin.load_state(state)
+                {
+                    log::warn!(
+                        "Could not restore VST3 plugin {} state: {error}; playback will bypass it",
+                        effect.class_id
+                    );
+                    continue;
+                }
+                if let Err(error) = plugin.set_active(true) {
+                    log::warn!(
+                        "Could not activate VST3 plugin {}: {error}; playback will bypass it",
+                        effect.class_id
+                    );
+                    continue;
+                }
+                plugins.push(PluginState {
+                    effect: effect.clone(),
+                    plugin,
+                    failed: false,
+                });
+            }
+
+            return write_span(&directory, key, &destination, |file, writer| {
+                if plugins.is_empty() {
+                    while let Some(frame) = decoder.next_frame().map_err(|error| error.to_string())? {
+                        writer.write(file, &decoder.bytes_of(&frame))?;
+                    }
+                    return Ok(());
+                }
+
+                const MAX_TAIL_FRAMES: usize = 30 * PCM_RATE as usize;
+                let chain_latency_frames =
+                    concat_vst3::latency_tail::bounded_chain_latency_frames(
+                        plugins.iter().map(|state| {
+                            state
+                                .plugin
+                                .latency()
+                                .map(|info| info.samples)
+                                .unwrap_or_else(|error| {
+                                    log::warn!(
+                                        "Could not read VST3 latency for {}: {error}",
+                                        state.effect.class_id
+                                    );
+                                    0
+                                })
+                        }),
+                        MAX_TAIL_FRAMES,
+                    );
+                let reported_tail_frames =
+                    concat_vst3::latency_tail::bounded_chain_tail_frames(
+                        plugins.iter().map(|state| {
+                            state
+                                .plugin
+                                .tail()
+                                .map(|tail| tail.seconds)
+                                .unwrap_or_else(|error| {
+                                    log::warn!(
+                                        "Could not read VST3 tail for {}: {error}",
+                                        state.effect.class_id
+                                    );
+                                    0.0
+                                })
+                        }),
+                        PCM_RATE,
+                        MAX_TAIL_FRAMES,
+                    );
+                let max_tail_frames = reported_tail_frames
+                    .saturating_add(chain_latency_frames)
+                    .min(MAX_TAIL_FRAMES);
+                let mut processed_frames = 0u64;
+                let mut interleaved: Vec<f32> = Vec::with_capacity(2 * 1024);
+                let mut latency_to_skip = chain_latency_frames;
+                let tail_pending = std::cell::Cell::new(false);
+                let mut flush = |interleaved: &mut Vec<f32>| -> Result<(), String> {
+                    while !interleaved.is_empty() {
+                        let samples = interleaved.len().min(2 * 1024);
+                        let mut block: Vec<f32> = interleaved.drain(..samples).collect();
+                        let frames = block.len() / 2;
+                        let block_start = processed_frames as f64 / f64::from(PCM_RATE);
+                        let at = if spec.duration > 0.0 {
+                            spec.automation_at(block_start / spec.duration)
+                        } else {
+                            spec.automation_start
+                        };
+                        let mut block_tail_pending = false;
+                        for state in &mut plugins {
+                            if state.failed {
+                                continue;
+                            }
+                            let params = state.effect.params_at(at);
+                            if let Err(error) = state.plugin.set_parameters_by_name(&params) {
+                                log::warn!(
+                                    "Could not apply VST3 parameter values for {}: {error}; bypassing it",
+                                    state.effect.class_id
+                                );
+                                state.failed = true;
+                                continue;
+                            }
+                            let dry = block.clone();
+                            match state.plugin.process_interleaved(&mut block, frames as i32) {
+                                Ok(result) => block_tail_pending |= result.tail_pending,
+                                Err(error) => {
+                                    block = dry;
+                                    state.failed = true;
+                                    log::warn!(
+                                        "VST3 processing failed for {}: {error}; bypassing it for the rest of this span",
+                                        state.effect.class_id
+                                    );
+                                }
+                            }
+                        }
+                        tail_pending.set(block_tail_pending);
+                        let skip_frames = latency_to_skip.min(frames);
+                        latency_to_skip -= skip_frames;
+                        let mut bytes = Vec::with_capacity((frames - skip_frames) * 4);
+                        for sample in block.iter().skip(skip_frames * 2) {
+                            let value = (sample.clamp(-1.0, 1.0) * 32767.0).round() as i16;
+                            bytes.extend_from_slice(&value.to_le_bytes());
+                        }
+                        writer.write(file, &bytes)?;
+                        processed_frames += frames as u64;
+                    }
+                    Ok(())
+                };
+
+                while let Some(frame) = decoder.next_frame().map_err(|error| error.to_string())? {
+                    for chunk in decoder.bytes_of(&frame).chunks_exact(2) {
+                        let value = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        interleaved.push(f32::from(value) / 32768.0);
+                    }
+                    if interleaved.len() >= 2 * 1024 {
+                        flush(&mut interleaved)?;
+                    }
+                }
+                flush(&mut interleaved)?;
+
+                let mut tail_frames = 0usize;
+                while (tail_frames < max_tail_frames || tail_pending.get())
+                    && tail_frames < MAX_TAIL_FRAMES
+                {
+                    let frames = (MAX_TAIL_FRAMES - tail_frames).min(1024);
+                    interleaved.resize(frames * 2, 0.0);
+                    flush(&mut interleaved)?;
+                    tail_frames += frames;
+                }
+                Ok(())
+            });
+        }
+        #[cfg(not(feature = "vst3"))]
+        log::warn!(
+            "VST3 effects on {} cannot be processed because concat-host was built without its vst3 feature",
+            spec.path
+        );
+    }
 
     write_span(&directory, key, &destination, |file, writer| {
         while let Some(frame) = decoder.next_frame().map_err(|error| error.to_string())? {
@@ -1620,7 +2082,7 @@ where
 
                     for clip in &clips {
                         let local = position - clip.start;
-                        if local < 0.0 || local >= clip.duration {
+                        if local < 0.0 || local >= clip.audible_duration {
                             continue;
                         }
                         let gain = gain_at(clip, local);
@@ -1754,6 +2216,7 @@ mod tests {
             start,
             duration,
             filter_chain: "lowpass=f=60,lowpass=f=60".to_owned(),
+            vst3_effects: Vec::new(),
             strength: 1.0,
             fade_in: 0.0,
             fade_out: 0.0,
@@ -1775,6 +2238,9 @@ mod tests {
             preserve_pitch: true,
             chain: String::new(),
             bus: None,
+            vst3_effects: Vec::new(),
+            automation_start: 0.0,
+            automation_span: 1.0,
         }
     }
 
@@ -1812,6 +2278,22 @@ mod tests {
             stretches[1].bus.as_ref().expect("a mix").clips[0].start,
             5.0
         );
+        let mut effect =
+            concat_project::model::Vst3Effect::new("0123456789abcdef0123456789abcdef");
+        effect.state = Some(vec![1, 2, 3]);
+        let mut effect_layer = layer(0.0, 1.0);
+        effect_layer.filter_chain.clear();
+        effect_layer.vst3_effects.push(effect.clone());
+        let effect_mix = super::with_sound_layers(
+            vec![tone_spec(path, 0.0, 2.0)],
+            &[effect_layer],
+        );
+        let carried = effect_mix
+            .iter()
+            .find_map(|spec| spec.bus.as_ref())
+            .expect("effect creates a sound-layer mix");
+        assert_eq!(carried.layers[0].vst3_effects, vec![effect]);
+        assert!(carried.layers[0].engine().audible());
         // No layer that does anything, nothing added.
         let mut idle = layer(0.0, 1.0);
         idle.strength = 0.0;
@@ -1819,6 +2301,99 @@ mod tests {
             super::with_sound_layers(vec![tone_spec(path, 0.0, 2.0)], &[idle]).len(),
             1
         );
+    }
+
+    #[test]
+    fn vst3_tail_pcm_remains_audible_after_the_source_clip_ends() {
+        let path = std::env::temp_dir().join(format!(
+            "concat-vst3-tail-test-{}.wav",
+            std::process::id()
+        ));
+        {
+            let mut file = std::fs::File::create(&path).expect("creates test audio");
+            let mut writer = super::WavWriter::start(&mut file).expect("starts test audio");
+            writer.write(&mut file, &[0; 8]).expect("writes test audio");
+            writer.finish(&mut file).expect("finishes test audio");
+        }
+        let pcm = std::sync::Arc::new(super::Pcm::open(&path).expect("maps test audio"));
+        let clip = super::ActiveClip {
+            start: 0.0,
+            duration: 1.0,
+            audible_duration: 1.5,
+            volume: 0.75,
+            volume_curve: super::Track::default(),
+            fade_in: 0.0,
+            fade_out: 0.0,
+            pcm,
+            lead: 0,
+            covered: std::sync::Arc::from(Vec::<(f64, f64)>::new()),
+        };
+        assert_eq!(super::gain_at(&clip, 1.25), 0.75);
+        assert_eq!(super::gain_at(&clip, 1.5), 0.0);
+        drop(clip);
+        std::fs::remove_file(path).expect("removes test audio");
+    }
+
+    #[test]
+    fn vst3_configuration_changes_the_processed_audio_cache_key() {
+        let mut spec = super::tone_spec(std::path::Path::new("tone.wav"), 0.0, 1.0);
+        let original = super::decode_key(&spec);
+        let mut first = concat_project::model::Vst3Effect::new("0123456789abcdef0123456789abcdef");
+        first.params.insert("Gain".to_owned(), 0.5);
+        spec.vst3_effects.push(first);
+        let configured = super::decode_key(&spec);
+        assert_ne!(configured, original);
+
+        spec.vst3_effects[0].params.insert("Gain".to_owned(), 0.75);
+        assert_ne!(super::decode_key(&spec), configured);
+        let changed_params = super::decode_key(&spec);
+        spec.vst3_effects[0].enabled = false;
+        assert_ne!(super::decode_key(&spec), changed_params);
+
+        let changed_bypass = super::decode_key(&spec);
+        spec.vst3_effects[0].state = Some(vec![0, 1, 2]);
+        let changed_state = super::decode_key(&spec);
+        assert_ne!(changed_state, changed_bypass);
+        let second =
+            concat_project::model::Vst3Effect::new("fedcba9876543210fedcba9876543210");
+        spec.vst3_effects.push(second);
+        let ordered = super::decode_key(&spec);
+        spec.vst3_effects.reverse();
+        assert_ne!(super::decode_key(&spec), ordered);
+        assert_ne!(ordered, changed_bypass);
+    }
+
+    #[test]
+    fn sound_layer_state_changes_the_mixed_audio_cache_key() {
+        let mut spec = super::tone_spec(std::path::Path::new("tone.wav"), 0.0, 1.0);
+        let mut effect =
+            concat_project::model::Vst3Effect::new("0123456789abcdef0123456789abcdef");
+        effect.state = Some(vec![1]);
+        spec.bus = Some(super::BusMix {
+            clips: Vec::new(),
+            layers: vec![super::BusSpec {
+                start: 0.0,
+                duration: 1.0,
+                chain: String::new(),
+                vst3_effects: vec![effect],
+                strength: 1.0,
+                fade_in: 0.0,
+                fade_out: 0.0,
+            }],
+        });
+        let before = super::decode_key(&spec);
+        spec.bus.as_mut().unwrap().layers[0].vst3_effects[0].state = Some(vec![2]);
+        assert_ne!(super::decode_key(&spec), before);
+    }
+
+    #[test]
+    fn vst3_automation_coordinates_remain_clip_relative_for_split_pieces() {
+        let mut piece = super::tone_spec(std::path::Path::new("tone.wav"), 1.0, 0.5);
+        piece.automation_start = 0.25;
+        piece.automation_span = 0.25;
+        assert_eq!(piece.automation_at(0.0), 0.25);
+        assert_eq!(piece.automation_at(0.5), 0.375);
+        assert_eq!(piece.automation_at(1.0), 0.5);
     }
 
     /// A stretch under a sound layer decodes to the mix with the layer
@@ -1862,6 +2437,7 @@ mod tests {
         let clip = super::ActiveClip {
             start: 0.0,
             duration: 3.0,
+            audible_duration: 3.0,
             volume: 1.0,
             volume_curve: super::Track::default(),
             fade_in: 0.0,

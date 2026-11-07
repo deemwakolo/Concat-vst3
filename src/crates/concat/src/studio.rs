@@ -27,7 +27,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use concat_effects::Catalogue;
 use concat_effects::manifest::Kind as PackageKind;
@@ -1393,6 +1393,22 @@ fn same_folder(a: &str, b: &str) -> bool {
         )
 }
 
+static VST3_REGISTRY: OnceLock<concat_vst3::Registry> = OnceLock::new();
+
+fn vst3_catalogue() -> Vec<concat_vst3::PluginDescriptor> {
+    VST3_REGISTRY
+        .get_or_init(|| concat_vst3::Registry::scan().unwrap_or_default())
+        .all()
+}
+
+fn vst3_id(class_id: &str) -> String {
+    format!("vst3:{class_id}")
+}
+
+fn vst3_class_id(id: &str) -> Option<&str> {
+    id.strip_prefix("vst3:").filter(|class_id| !class_id.is_empty())
+}
+
 /// A look made from a table - an imported `.cube`, or any package that
 /// carries a `[lut]` - which the Adjustments page's LUTs shelf lists and
 /// the Filters page does not.
@@ -1528,6 +1544,9 @@ fn commit_key(commands: &[Command]) -> String {
                 }
                 if patch.filters.is_some() {
                     fields.push("filters");
+                }
+                if patch.vst3_effects.is_some() {
+                    fields.push("vst3_effects");
                 }
                 if patch.crop.is_some() {
                     fields.push("crop");

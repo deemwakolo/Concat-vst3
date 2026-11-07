@@ -70,6 +70,7 @@ pub fn flatten_timeline_in(
                     fade_in: clip.fade_in,
                     fade_out: clip.fade_out,
                     effects: clip.video_effects.clone(),
+                vst3_effects: clip.vst3_effects.clone(),
                     opacity: clip.opacity,
                     has_audio: Some(false),
                     ..ExportClip::blank(ClipKind::Layer, clip.start, clip.duration, index)
@@ -164,6 +165,7 @@ pub fn flatten_timeline_in(
                     .filter(|crop| !crop.is_none())
                     .map(|crop| [crop.left, crop.top, crop.right, crop.bottom]),
                 effects: clip.video_effects.clone(),
+                vst3_effects: clip.vst3_effects.clone(),
                 scale: export_base(clip, KeyProperty::Scale),
                 offset_x: export_base(clip, KeyProperty::OffsetX),
                 offset_y: export_base(clip, KeyProperty::OffsetY),

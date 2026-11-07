@@ -13,6 +13,8 @@
 //! `Clip::source_time_at` is the one definition for picture.
 
 use std::path::Path;
+#[cfg(feature = "vst3")]
+use std::sync::OnceLock;
 
 use concat_core::animate::Track;
 use concat_core::time::Rational;
@@ -25,6 +27,9 @@ use ffmpeg_the_third::util::frame::audio::Audio;
 
 use crate::error::{Error, Result};
 use crate::ffi;
+
+#[cfg(feature = "vst3")]
+static VST3_REGISTRY: OnceLock<concat_vst3::Registry> = OnceLock::new();
 
 /// The rate everything is mixed at.
 pub const MIX_RATE: u32 = 48_000;
@@ -77,6 +82,13 @@ pub struct AudioClip {
     pub fade_out: f64,
     /// Extra FFmpeg audio filters, or empty. Validated, not trusted.
     pub filter_chain: String,
+    /// VST3 audio effects for this clip, in order.
+    pub vst3_effects: Vec<concat_project::model::Vst3Effect>,
+    /// Start fraction of the original project clip represented by this
+    /// rendered piece; used to keep VST3 automation on the clip clock.
+    pub automation_start: f64,
+    /// Fraction of the original clip represented by this piece.
+    pub automation_span: f64,
 }
 
 /// A treatment of the whole mix over a stretch of the timeline: a sound
@@ -97,6 +109,8 @@ pub struct AudioBus {
     pub duration: f64,
     /// The FFmpeg audio filters run over the mix. Validated, not trusted.
     pub filter_chain: String,
+    /// VST3 effects applied after the native filters, in order.
+    pub vst3_effects: Vec<concat_project::model::Vst3Effect>,
     /// How much of the treated sound replaces the untreated, `0..=1`: the
     /// layer's wet and dry.
     pub strength: f64,
@@ -115,7 +129,10 @@ impl AudioBus {
     /// Whether the bus changes anything: a chain to run, some strength to
     /// run it at, and some time to run it for.
     pub fn audible(&self) -> bool {
-        !self.filter_chain.is_empty() && self.strength > 0.0 && self.duration > 0.0
+        (!self.filter_chain.is_empty()
+            || self.vst3_effects.iter().any(|effect| effect.enabled))
+            && self.strength > 0.0
+            && self.duration > 0.0
     }
 }
 
@@ -259,6 +276,18 @@ pub fn mix_graph(clips: &[AudioClip]) -> Result<String> {
 /// [`mix_graph`] with sound layers over the mix: each bus treats the sum
 /// of every clip for its span, in the order given.
 pub fn mix_graph_with(clips: &[AudioClip], buses: &[AudioBus]) -> Result<String> {
+    if clips
+        .iter()
+        .any(|clip| clip.vst3_effects.iter().any(|effect| effect.enabled))
+        || buses
+            .iter()
+            .any(|bus| bus.vst3_effects.iter().any(|effect| effect.enabled))
+    {
+        return Err(Error::Missing {
+            what: "VST3 filtergraph integration",
+            name: "use audio::mix_to_file_with or audio::mix_pcm".to_owned(),
+        });
+    }
     let heard: Vec<Heard> = clips.iter().map(Heard::whole).collect();
     mix_graph_from(clips, &heard, 0.0, buses)
 }
@@ -594,6 +623,784 @@ fn aac_encoder() -> Result<(&'static str, Sample)> {
     })
 }
 
+#[cfg(feature = "vst3")]
+struct OfflinePlugin {
+    effect: concat_project::model::Vst3Effect,
+    plugin: concat_vst3::Plugin,
+    failed: bool,
+}
+
+#[cfg(feature = "vst3")]
+struct Vst3TempDir(std::path::PathBuf);
+
+#[cfg(feature = "vst3")]
+impl Drop for Vst3TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(feature = "vst3")]
+fn render_vst3_clip(
+    clip: &AudioClip,
+    destination: &Path,
+) -> Result<Option<(std::path::PathBuf, f64)>> {
+    use crate::{AudioDecoder, AudioOptions, SampleFormat};
+    use std::io::Write;
+
+    validate_chain(&clip.filter_chain)?;
+    let registry = VST3_REGISTRY.get_or_init(|| {
+        concat_vst3::Registry::scan().unwrap_or_else(|error| {
+            log::warn!("VST3 discovery failed during export: {error}");
+            concat_vst3::Registry::empty()
+        })
+    });
+    let mut plugins = Vec::new();
+    for effect in &clip.vst3_effects {
+        if !effect.enabled {
+            continue;
+        }
+        let Some(descriptor) = registry.resolve(&effect.class_id) else {
+            log::warn!(
+                "VST3 plugin {} is unavailable; export will bypass it",
+                effect.class_id
+            );
+            continue;
+        };
+        let module = match registry.load_module(&effect.class_id) {
+            Ok(module) => module,
+            Err(error) => {
+                log::warn!(
+                    "Could not load VST3 plugin {} for export: {error}; bypassing it",
+                    effect.class_id
+                );
+                continue;
+            }
+        };
+        let Some(class_id) = concat_vst3::bridge::ClassId::from_fuid(&descriptor.class_id) else {
+            log::warn!(
+                "VST3 plugin {} has an invalid class identifier; export will bypass it",
+                effect.class_id
+            );
+            continue;
+        };
+        let mut plugin = match concat_vst3::Plugin::create(module, &class_id) {
+            Ok(plugin) => plugin,
+            Err(error) => {
+                log::warn!(
+                    "Could not instantiate VST3 plugin {} for export: {error}; bypassing it",
+                    effect.class_id
+                );
+                continue;
+            }
+        };
+        if let Err(error) = plugin.initialize(f64::from(MIX_RATE), 1024, 2) {
+            log::warn!(
+                "Could not initialize VST3 plugin {} for export: {error}; bypassing it",
+                effect.class_id
+            );
+            continue;
+        }
+        if let Some(state) = &effect.state
+            && let Err(error) = plugin.load_state(state)
+        {
+            log::warn!(
+                "Could not restore VST3 plugin {} state for export: {error}; bypassing it",
+                effect.class_id
+            );
+            continue;
+        }
+        if let Err(error) = plugin.set_active(true) {
+            log::warn!(
+                "Could not activate VST3 plugin {} for export: {error}; bypassing it",
+                effect.class_id
+            );
+            continue;
+        }
+        plugins.push(OfflinePlugin {
+            effect: effect.clone(),
+            plugin,
+            failed: false,
+        });
+    }
+    if plugins.is_empty() {
+        return Ok(None);
+    }
+
+    let mut filters = speed_filters(clip.speed, clip.preserve_pitch);
+    if !clip.filter_chain.is_empty() {
+        filters.push(clip.filter_chain.clone());
+    }
+    let mut decoder = AudioDecoder::open(
+        &clip.path,
+        &AudioOptions {
+            start: Some(clip.source_start),
+            duration: Some(clip.duration * clamp_speed(clip.speed)),
+            filters,
+            rate: MIX_RATE,
+            channels: 2,
+            format: SampleFormat::I16,
+            stream: clip.stream,
+        },
+    )?;
+    let path = destination.to_path_buf();
+    let io_error = |source| Error::Io {
+        path: path.clone(),
+        source,
+    };
+    let mut file = std::fs::File::create(&path).map_err(io_error)?;
+    file.write_all(&[0; 44]).map_err(io_error)?;
+    let mut data_bytes = 0u64;
+    let expected_frames = (clip.duration.max(0.0) * f64::from(MIX_RATE)).round() as u64;
+    let mut decoded_frames = 0u64;
+    let mut output_frames = 0u64;
+    let max_tail = 30 * MIX_RATE as usize;
+    let chain_latency_frames =
+        concat_vst3::latency_tail::bounded_chain_latency_frames(
+            plugins.iter().map(|state| {
+                state
+                    .plugin
+                    .latency()
+                    .map(|latency| latency.samples)
+                    .unwrap_or_else(|error| {
+                        log::warn!(
+                            "Could not read VST3 latency for {} during export: {error}",
+                            state.effect.class_id
+                        );
+                        0
+                    })
+            }),
+            max_tail,
+        );
+    let mut latency_to_skip = chain_latency_frames;
+    let reported_tail = concat_vst3::latency_tail::bounded_chain_tail_frames(
+        plugins.iter().map(|state| {
+            state
+                .plugin
+                .tail()
+                .map(|tail| tail.seconds)
+                .unwrap_or_else(|error| {
+                    log::warn!(
+                        "Could not read VST3 tail for {} during export: {error}",
+                        state.effect.class_id
+                    );
+                    0.0
+                })
+        }),
+        MIX_RATE,
+        max_tail,
+    );
+    let required_tail = reported_tail
+        .saturating_add(chain_latency_frames)
+        .min(max_tail);
+    let tail_pending = std::cell::Cell::new(false);
+    let mut write_block = |block: &mut [f32], at: f64| -> Result<()> {
+        let frames = block.len() / 2;
+        let mut pending = false;
+        for state in &mut plugins {
+            if state.failed {
+                continue;
+            }
+            let params = state.effect.params_at(
+                clip.automation_start + at * clip.automation_span,
+            );
+            if let Err(error) = state.plugin.set_parameters_by_name(&params) {
+                log::warn!(
+                    "Could not apply VST3 parameter values for {} during export: {error}; bypassing it",
+                    state.effect.class_id
+                );
+                state.failed = true;
+            }
+            if state.failed {
+                continue;
+            }
+            let dry = block.to_vec();
+            match state.plugin.process_interleaved(block, frames as i32) {
+                Ok(result) => pending |= result.tail_pending,
+                Err(error) => {
+                    block.copy_from_slice(&dry);
+                    state.failed = true;
+                    log::warn!(
+                        "VST3 processing failed for {} during export: {error}; bypassing it",
+                        state.effect.class_id
+                    );
+                }
+            }
+        }
+        tail_pending.set(pending);
+        let skip = latency_to_skip.min(frames);
+        latency_to_skip -= skip;
+        let mut bytes = Vec::with_capacity((frames - skip) * 4);
+        for frame in block[skip * 2..].chunks_exact(2) {
+            let local = output_frames as f64 / f64::from(MIX_RATE);
+            let mut gain = if clip.volume_curve.is_empty() {
+                clip.volume
+            } else {
+                let fraction = if clip.duration > 0.0 {
+                    (local / clip.duration).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                clip.volume_curve.value_at(fraction, clip.volume)
+            };
+            if local <= clip.duration {
+                if clip.fade_in > 0.0 {
+                    gain *= (local / clip.fade_in).min(1.0);
+                }
+                if clip.fade_out > 0.0 {
+                    gain *= ((clip.duration - local) / clip.fade_out).min(1.0);
+                }
+            }
+            for sample in frame {
+                let value = (f64::from(*sample).clamp(-1.0, 1.0)
+                    * gain.clamp(0.0, f64::MAX)
+                    * 32767.0)
+                    .round() as i16;
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            output_frames += 1;
+        }
+        file.write_all(&bytes).map_err(io_error)?;
+        data_bytes += bytes.len() as u64;
+        Ok(())
+    };
+
+    let mut interleaved = Vec::with_capacity(2 * 1024);
+    while let Some(frame) = decoder.next_frame()? {
+        for sample in decoder.bytes_of(&frame).chunks_exact(2) {
+            interleaved.push(
+                f32::from(i16::from_le_bytes([sample[0], sample[1]])) / 32768.0,
+            );
+            if interleaved.len() == 2 * 1024 {
+                let at = if expected_frames > 0 {
+                    (decoded_frames as f64 / expected_frames as f64).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                write_block(&mut interleaved, at)?;
+                decoded_frames += 1024;
+                interleaved.clear();
+            }
+        }
+    }
+    if !interleaved.is_empty() {
+        let frames = interleaved.len() / 2;
+        let at = if expected_frames > 0 {
+            (decoded_frames as f64 / expected_frames as f64).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        write_block(&mut interleaved, at)?;
+        decoded_frames += frames as u64;
+        interleaved.clear();
+    }
+
+    let mut silence_frames = 0usize;
+    while (silence_frames < required_tail || tail_pending.get()) && silence_frames < max_tail {
+        let frames = (max_tail - silence_frames).min(1024);
+        let mut silence = vec![0.0; frames * 2];
+        write_block(&mut silence, 1.0)?;
+        silence_frames += frames;
+    }
+    drop(write_block);
+
+    if data_bytes > u64::from(u32::MAX - 36) {
+        return Err(Error::Probe {
+            path: path.clone(),
+            detail: "processed VST3 audio exceeds the WAV size limit".to_owned(),
+        });
+    }
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+    let data_len = data_bytes as u32;
+    file.write_all(b"RIFF").map_err(io_error)?;
+    file.write_all(&(36u32 + data_len).to_le_bytes())
+        .map_err(io_error)?;
+    file.write_all(b"WAVEfmt ").map_err(io_error)?;
+    file.write_all(&16u32.to_le_bytes()).map_err(io_error)?;
+    file.write_all(&1u16.to_le_bytes()).map_err(io_error)?;
+    file.write_all(&2u16.to_le_bytes()).map_err(io_error)?;
+    file.write_all(&MIX_RATE.to_le_bytes()).map_err(io_error)?;
+    file.write_all(&(MIX_RATE * 4).to_le_bytes())
+        .map_err(io_error)?;
+    file.write_all(&4u16.to_le_bytes()).map_err(io_error)?;
+    file.write_all(&16u16.to_le_bytes()).map_err(io_error)?;
+    file.write_all(b"data").map_err(io_error)?;
+    file.write_all(&data_len.to_le_bytes()).map_err(io_error)?;
+    file.flush().map_err(io_error)?;
+
+    let tail_seconds = silence_frames.saturating_sub(chain_latency_frames) as f64
+        / f64::from(MIX_RATE);
+    Ok(Some((path, tail_seconds)))
+}
+
+#[cfg(feature = "vst3")]
+fn prepare_vst3_clips(
+    clips: &[AudioClip],
+    destination: &Path,
+) -> Result<(Vec<AudioClip>, Vst3TempDir)> {
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = parent.join(format!(
+        ".concat-vst3-{}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&directory).map_err(|source| Error::Io {
+        path: directory.clone(),
+        source,
+    })?;
+    let temp = Vst3TempDir(directory.clone());
+    let mut prepared = Vec::with_capacity(clips.len());
+    for (index, clip) in clips.iter().enumerate() {
+        let mut clip = clip.clone();
+        if clip.vst3_effects.iter().any(|effect| effect.enabled) {
+            let path = directory.join(format!("clip-{index}.wav"));
+            if let Some((path, tail_seconds)) = render_vst3_clip(&clip, &path)? {
+                clip.path = path;
+                clip.stream = None;
+                clip.source_start = 0.0;
+                clip.speed = 1.0;
+                clip.preserve_pitch = true;
+                clip.filter_chain.clear();
+                clip.duration += tail_seconds;
+                clip.volume = 1.0;
+                clip.volume_curve = concat_core::animate::Track::default();
+                clip.fade_in = 0.0;
+                clip.fade_out = 0.0;
+            }
+            clip.vst3_effects.clear();
+        }
+        prepared.push(clip);
+    }
+    Ok((prepared, temp))
+}
+
+#[cfg(feature = "vst3")]
+fn prepare_vst3_buses(
+    clips: &[AudioClip],
+    buses: &[AudioBus],
+    duration: f64,
+    destination: &Path,
+) -> Result<(std::path::PathBuf, f64, Vst3TempDir)> {
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let directory = parent.join(format!(
+        ".concat-vst3-bus-{}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&directory).map_err(|source| Error::Io {
+        path: directory.clone(),
+        source,
+    })?;
+    let temporary = Vst3TempDir(directory.clone());
+    let full_duration = buses
+        .iter()
+        .filter(|bus| bus.audible())
+        .fold(duration.max(0.0), |end, bus| end.max(bus.end()));
+    let mut current = directory.join("mix-0.wav");
+    mix_to_file_with(clips, &[], full_duration, &current)?;
+    let mut current_duration = crate::probe(&current)?
+        .duration
+        .ok_or_else(|| Error::Probe {
+            path: current.clone(),
+            detail: "mixed audio has no measurable duration".to_owned(),
+        })?
+        .as_f64();
+
+    for (index, bus) in buses.iter().filter(|bus| bus.audible()).enumerate() {
+        let next = directory.join(format!("mix-{}.wav", index + 1));
+        let active_start = bus.start.max(0.0);
+        let active_end = bus.end().min(current_duration);
+        if active_end <= active_start {
+            continue;
+        }
+
+        let source_duration = active_end - active_start;
+        let automation_start = if bus.duration > 0.0 {
+            ((active_start - bus.start) / bus.duration).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let automation_span = if bus.duration > 0.0 {
+            (source_duration / bus.duration).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let edge = BUS_EDGE.min(source_duration / 2.0).max(1e-4);
+        let ramp_in = bus.fade_in.clamp(edge, source_duration.max(edge));
+        let ramp_out = bus.fade_out.clamp(edge, source_duration.max(edge));
+        let input_fades = format!(
+            "afade=t=in:st=0:d={edge:.6},afade=t=out:st={:.6}:d={edge:.6},\
+             afade=t=in:st=0:d={ramp_in:.6},afade=t=out:st={:.6}:d={ramp_out:.6}",
+            (source_duration - edge).max(0.0),
+            (source_duration - ramp_out).max(0.0)
+        );
+        let filter_chain = if bus.filter_chain.is_empty() {
+            input_fades
+        } else {
+            format!("{input_fades},{}", bus.filter_chain)
+        };
+        let wet_clip = AudioClip {
+            path: current.clone(),
+            stream: None,
+            start: active_start,
+            duration: source_duration,
+            source_start: active_start,
+            speed: 1.0,
+            preserve_pitch: true,
+            volume: 1.0,
+            volume_curve: concat_core::animate::Track::default(),
+            fade_in: 0.0,
+            fade_out: 0.0,
+            filter_chain,
+            vst3_effects: bus.vst3_effects.clone(),
+            automation_start,
+            automation_span,
+        };
+        let next_duration = if let Some((wet_path, tail_seconds)) =
+            render_vst3_clip(&wet_clip, &directory.join(format!("wet-{index}.wav")))?
+        {
+            Some(blend_vst3_bus(
+                &current,
+                current_duration,
+                &wet_path,
+                source_duration + tail_seconds,
+                bus,
+                active_start,
+                &next,
+            )?)
+        } else if !bus.filter_chain.is_empty() {
+            let source = AudioClip {
+                path: current.clone(),
+                stream: None,
+                start: 0.0,
+                duration: current_duration,
+                source_start: 0.0,
+                speed: 1.0,
+                preserve_pitch: true,
+                volume: 1.0,
+                volume_curve: concat_core::animate::Track::default(),
+                fade_in: 0.0,
+                fade_out: 0.0,
+                filter_chain: String::new(),
+                vst3_effects: Vec::new(),
+                automation_start: 0.0,
+                automation_span: 1.0,
+            };
+            let mut native_bus = bus.clone();
+            native_bus.vst3_effects.clear();
+            mix_to_file_with(&[source], &[native_bus], current_duration, &next)?;
+            Some(
+                crate::probe(&next)?
+                    .duration
+                    .ok_or_else(|| Error::Probe {
+                        path: next.clone(),
+                        detail: "processed sound layer has no measurable duration".to_owned(),
+                    })?
+                    .as_f64(),
+            )
+        } else {
+            None
+        };
+
+        let Some(next_duration) = next_duration else {
+            continue;
+        };
+        current = next;
+        current_duration = next_duration;
+    }
+
+    Ok((current, current_duration, temporary))
+}
+
+#[cfg(feature = "vst3")]
+fn next_stereo_sample(
+    decoder: &mut crate::AudioDecoder,
+    pending: &mut std::collections::VecDeque<[i16; 2]>,
+) -> Result<Option<[i16; 2]>> {
+    while pending.is_empty() {
+        let Some(frame) = decoder.next_frame()? else {
+            return Ok(None);
+        };
+        pending.extend(
+            decoder
+                .bytes_of(&frame)
+                .chunks_exact(4)
+                .map(|pair| {
+                    [
+                        i16::from_le_bytes([pair[0], pair[1]]),
+                        i16::from_le_bytes([pair[2], pair[3]]),
+                    ]
+                }),
+        );
+    }
+    Ok(pending.pop_front())
+}
+
+#[cfg(feature = "vst3")]
+fn write_vst3_wav_header(
+    file: &mut std::fs::File,
+    path: &Path,
+    data_bytes: u64,
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let io = |source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    };
+    if data_bytes > u64::from(u32::MAX - 36) {
+        return Err(Error::Probe {
+            path: path.to_path_buf(),
+            detail: "processed VST3 audio exceeds the WAV size limit".to_owned(),
+        });
+    }
+    file.seek(SeekFrom::Start(0)).map_err(io)?;
+    let data_len = data_bytes as u32;
+    file.write_all(b"RIFF").map_err(io)?;
+    file.write_all(&(36u32 + data_len).to_le_bytes())
+        .map_err(io)?;
+    file.write_all(b"WAVEfmt ").map_err(io)?;
+    file.write_all(&16u32.to_le_bytes()).map_err(io)?;
+    file.write_all(&1u16.to_le_bytes()).map_err(io)?;
+    file.write_all(&2u16.to_le_bytes()).map_err(io)?;
+    file.write_all(&MIX_RATE.to_le_bytes()).map_err(io)?;
+    file.write_all(&(MIX_RATE * 4).to_le_bytes()).map_err(io)?;
+    file.write_all(&4u16.to_le_bytes()).map_err(io)?;
+    file.write_all(&16u16.to_le_bytes()).map_err(io)?;
+    file.write_all(b"data").map_err(io)?;
+    file.write_all(&data_len.to_le_bytes()).map_err(io)?;
+    file.flush().map_err(io)
+}
+
+#[cfg(feature = "vst3")]
+fn blend_vst3_bus(
+    dry_path: &Path,
+    dry_duration: f64,
+    wet_path: &Path,
+    wet_duration: f64,
+    bus: &AudioBus,
+    wet_start: f64,
+    destination: &Path,
+) -> Result<f64> {
+    use crate::{AudioDecoder, AudioOptions, SampleFormat};
+    use std::io::Write;
+
+    let options = |duration| AudioOptions {
+        start: None,
+        duration: Some(duration),
+        filters: Vec::new(),
+        rate: MIX_RATE,
+        channels: 2,
+        format: SampleFormat::I16,
+        stream: None,
+    };
+    let mut dry = AudioDecoder::open(dry_path, &options(dry_duration))?;
+    let mut wet = AudioDecoder::open(wet_path, &options(wet_duration))?;
+    let dry_frames = (dry_duration.max(0.0) * f64::from(MIX_RATE)).round() as u64;
+    let wet_frames = (wet_duration.max(0.0) * f64::from(MIX_RATE)).round() as u64;
+    let wet_start_frame = (wet_start.max(0.0) * f64::from(MIX_RATE)).round() as u64;
+    let bus_start_frame = (bus.start.max(0.0) * f64::from(MIX_RATE)).round() as u64;
+    let bus_end_frame = (bus.end().max(0.0) * f64::from(MIX_RATE)).round() as u64;
+    let total_frames = dry_frames.max(wet_start_frame.saturating_add(wet_frames));
+    if total_frames > u64::from(u32::MAX - 36) / 4 {
+        return Err(Error::Probe {
+            path: destination.to_path_buf(),
+            detail: "sound-layer VST3 output exceeds the WAV size limit".to_owned(),
+        });
+    }
+    let duration = total_frames as f64 / f64::from(MIX_RATE);
+    let mut dry_pending = std::collections::VecDeque::new();
+    let mut wet_pending = std::collections::VecDeque::new();
+    let mut file = std::fs::File::create(destination).map_err(|source| Error::Io {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    file.write_all(&[0; 44]).map_err(|source| Error::Io {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+
+    let strength = if bus.strength.is_finite() {
+        bus.strength.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let edge = BUS_EDGE.min(bus.duration / 2.0).max(1e-4);
+    let ramp_in = bus.fade_in.clamp(edge, bus.duration.max(edge));
+    let ramp_out = bus.fade_out.clamp(edge, bus.duration.max(edge));
+    let mut data_bytes = 0u64;
+    let mut block = Vec::with_capacity(1024 * 4);
+    for frame_index in 0..total_frames {
+        let dry_sample = if frame_index < dry_frames {
+            next_stereo_sample(&mut dry, &mut dry_pending)?.unwrap_or([0, 0])
+        } else {
+            [0, 0]
+        };
+        let wet_index = frame_index.saturating_sub(wet_start_frame);
+        let wet_sample = if frame_index >= wet_start_frame && wet_index < wet_frames {
+            next_stereo_sample(&mut wet, &mut wet_pending)?.unwrap_or([0, 0])
+        } else {
+            [0, 0]
+        };
+        let time = frame_index as f64 / f64::from(MIX_RATE);
+        let gain = if frame_index >= bus_start_frame && frame_index < bus_end_frame {
+            let ramp = ((time - bus.start) / ramp_in)
+                .min((bus.end() - time) / ramp_out)
+                .clamp(0.0, 1.0);
+            strength * ramp
+        } else if frame_index >= bus_end_frame && frame_index >= wet_start_frame {
+            strength
+        } else {
+            0.0
+        };
+        for channel in 0..2 {
+            let dry_value = f64::from(dry_sample[channel]);
+            let wet_value = f64::from(wet_sample[channel]);
+            let mixed = if frame_index < bus_end_frame {
+                dry_value * (1.0 - gain) + wet_value * gain
+            } else {
+                dry_value + wet_value * gain
+            };
+            let sample = mixed.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16;
+            block.extend_from_slice(&sample.to_le_bytes());
+        }
+        if block.len() >= 1024 * 4 {
+            file.write_all(&block).map_err(|source| Error::Io {
+                path: destination.to_path_buf(),
+                source,
+            })?;
+            data_bytes += block.len() as u64;
+            block.clear();
+        }
+    }
+    if !block.is_empty() {
+        file.write_all(&block).map_err(|source| Error::Io {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+        data_bytes += block.len() as u64;
+    }
+    write_vst3_wav_header(&mut file, destination, data_bytes)?;
+    Ok(duration)
+}
+
+#[cfg(feature = "vst3")]
+fn mix_pcm_with_vst3_buses(
+    clips: &[AudioClip],
+    buses: &[AudioBus],
+    from: f64,
+    to: f64,
+    mut write: impl FnMut(&[u8]) -> Result<()>,
+) -> Result<()> {
+    use crate::{AudioDecoder, AudioOptions, SampleFormat};
+    use std::io::Write;
+
+    if !from.is_finite() || !to.is_finite() {
+        return Err(Error::Probe {
+            path: Path::new("the mix").to_path_buf(),
+            detail: "the audio window must have finite bounds".to_owned(),
+        });
+    }
+    let duration = (to - from).max(0.0);
+    if duration == 0.0 {
+        return Ok(());
+    }
+    static NEXT_TEMP: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(1);
+    let directory = std::env::temp_dir().join(format!(
+        "concat-vst3-pcm-{}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&directory).map_err(|source| Error::Io {
+        path: directory.clone(),
+        source,
+    })?;
+    let _temporary = Vst3TempDir(directory.clone());
+    let base_path = directory.join("base.wav");
+    let (prepared_clips, _clip_temporary) = prepare_vst3_clips(clips, &base_path)?;
+    let mut base_file = std::fs::File::create(&base_path).map_err(|source| Error::Io {
+        path: base_path.clone(),
+        source,
+    })?;
+    base_file.write_all(&[0; 44]).map_err(|source| Error::Io {
+        path: base_path.clone(),
+        source,
+    })?;
+    let mut base_bytes = 0u64;
+    mix_pcm(&prepared_clips, &[], from, to, |bytes| {
+        base_bytes = base_bytes.saturating_add(bytes.len() as u64);
+        if base_bytes > u64::from(u32::MAX - 36) {
+            return Err(Error::Probe {
+                path: base_path.clone(),
+                detail: "sound-layer source mix exceeds the WAV size limit".to_owned(),
+            });
+        }
+        base_file.write_all(bytes).map_err(|source| Error::Io {
+            path: base_path.clone(),
+            source,
+        })
+    })?;
+    write_vst3_wav_header(&mut base_file, &base_path, base_bytes)?;
+    drop(base_file);
+
+    let base_clip = AudioClip {
+        path: base_path,
+        stream: None,
+        start: 0.0,
+        duration,
+        source_start: 0.0,
+        speed: 1.0,
+        preserve_pitch: true,
+        volume: 1.0,
+        volume_curve: concat_core::animate::Track::default(),
+        fade_in: 0.0,
+        fade_out: 0.0,
+        filter_chain: String::new(),
+        vst3_effects: Vec::new(),
+        automation_start: 0.0,
+        automation_span: 1.0,
+    };
+    let shifted_buses: Vec<AudioBus> = buses
+        .iter()
+        .cloned()
+        .map(|mut bus| {
+            bus.start -= from;
+            bus
+        })
+        .collect();
+    let output = directory.join("mix.wav");
+    let (prepared, _, _bus_temporary) =
+        prepare_vst3_buses(&[base_clip], &shifted_buses, duration, &output)?;
+    let mut decoder = AudioDecoder::open(
+        &prepared,
+        &AudioOptions {
+            start: None,
+            duration: None,
+            filters: Vec::new(),
+            rate: MIX_RATE,
+            channels: 2,
+            format: SampleFormat::I16,
+            stream: None,
+        },
+    )?;
+    while let Some(frame) = decoder.next_frame()? {
+        write(&decoder.bytes_of(&frame))?;
+    }
+    Ok(())
+}
+
 /// Mixes `clips` into one audio file at `destination`: 16-bit PCM for a
 /// `.wav` destination (case-insensitive), Opus for a `.webm`, `.opus`,
 /// `.ogg` or `.mka` one, AAC otherwise, at 48 kHz stereo.
@@ -610,6 +1417,65 @@ pub fn mix_to_file_with(
     duration: f64,
     destination: &Path,
 ) -> Result<()> {
+    #[cfg(feature = "vst3")]
+    if buses
+        .iter()
+        .any(|bus| bus.vst3_effects.iter().any(|effect| effect.enabled))
+    {
+        let (prepared, prepared_duration, _temporary) =
+            prepare_vst3_buses(clips, buses, duration, destination)?;
+        let clip = AudioClip {
+            path: prepared,
+            stream: None,
+            start: 0.0,
+            duration: prepared_duration,
+            source_start: 0.0,
+            speed: 1.0,
+            preserve_pitch: true,
+            volume: 1.0,
+            volume_curve: concat_core::animate::Track::default(),
+            fade_in: 0.0,
+            fade_out: 0.0,
+            filter_chain: String::new(),
+            vst3_effects: Vec::new(),
+            automation_start: 0.0,
+            automation_span: 1.0,
+        };
+        return mix_to_file_with(&[clip], &[], prepared_duration, destination);
+    }
+    #[cfg(not(feature = "vst3"))]
+    if buses
+        .iter()
+        .any(|bus| bus.vst3_effects.iter().any(|effect| effect.enabled))
+    {
+        return Err(Error::Missing {
+            what: "VST3 processing feature",
+            name: "concat-media/vst3".to_owned(),
+        });
+    }
+
+    #[cfg(feature = "vst3")]
+    if clips
+        .iter()
+        .any(|clip| clip.vst3_effects.iter().any(|effect| effect.enabled))
+    {
+        let (prepared, _temporary) = prepare_vst3_clips(clips, destination)?;
+        let duration = prepared.iter().fold(duration, |end, clip| {
+            end.max(clip.start + clip.duration)
+        });
+        return mix_to_file_with(&prepared, buses, duration, destination);
+    }
+    #[cfg(not(feature = "vst3"))]
+    if clips
+        .iter()
+        .any(|clip| clip.vst3_effects.iter().any(|effect| effect.enabled))
+    {
+        return Err(Error::Missing {
+            what: "VST3 processing feature",
+            name: "concat-media/vst3".to_owned(),
+        });
+    }
+
     let extension = destination
         .extension()
         .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
@@ -778,6 +1644,44 @@ pub fn mix_pcm(
     to: f64,
     mut write: impl FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
+    #[cfg(feature = "vst3")]
+    if buses
+        .iter()
+        .any(|bus| bus.vst3_effects.iter().any(|effect| effect.enabled))
+    {
+        return mix_pcm_with_vst3_buses(clips, buses, from, to, write);
+    }
+    #[cfg(not(feature = "vst3"))]
+    if buses
+        .iter()
+        .any(|bus| bus.vst3_effects.iter().any(|effect| effect.enabled))
+    {
+        return Err(Error::Missing {
+            what: "VST3 processing feature",
+            name: "concat-media/vst3".to_owned(),
+        });
+    }
+
+    #[cfg(feature = "vst3")]
+    if clips
+        .iter()
+        .any(|clip| clip.vst3_effects.iter().any(|effect| effect.enabled))
+    {
+        let destination = std::env::temp_dir().join("concat-vst3-pcm.wav");
+        let (prepared, _temporary) = prepare_vst3_clips(clips, &destination)?;
+        return mix_pcm(&prepared, buses, from, to, write);
+    }
+    #[cfg(not(feature = "vst3"))]
+    if clips
+        .iter()
+        .any(|clip| clip.vst3_effects.iter().any(|effect| effect.enabled))
+    {
+        return Err(Error::Missing {
+            what: "VST3 processing feature",
+            name: "concat-media/vst3".to_owned(),
+        });
+    }
+
     ffi::init();
     for chain in clips
         .iter()
@@ -1061,6 +1965,17 @@ fn run_mix(
 /// asked, and a second pass would cost time and a generation of quality.
 /// The result ends with the shorter of the two.
 pub fn mux(video: &Path, audio: &Path, output: &Path) -> Result<()> {
+    mux_inner(video, audio, output, false)
+}
+
+/// Muxes audio without shortening its tail to the picture's end. The video
+/// stream remains unchanged; containers that support it retain the longer
+/// audio duration for plugin reverbs and delays.
+pub fn mux_with_audio_tail(video: &Path, audio: &Path, output: &Path) -> Result<()> {
+    mux_inner(video, audio, output, true)
+}
+
+fn mux_inner(video: &Path, audio: &Path, output: &Path, keep_longer_audio: bool) -> Result<()> {
     ffi::init();
     let video_in = ffmpeg::format::input(video).map_err(|error| ffi::fail("open", video, error))?;
     let audio_in = ffmpeg::format::input(audio).map_err(|error| ffi::fail("open", audio, error))?;
@@ -1139,11 +2054,15 @@ pub fn mux(video: &Path, audio: &Path, output: &Path) -> Result<()> {
         }
         // The file ends with the shorter of the two: once one stream has
         // run out, the other carries on only to where that one ended.
-        let cutoff = feeds
-            .iter()
-            .filter(|feed| feed.next.is_none())
-            .map(|feed| feed.end)
-            .min();
+        let cutoff = if keep_longer_audio {
+            None
+        } else {
+            feeds
+                .iter()
+                .filter(|feed| feed.next.is_none())
+                .map(|feed| feed.end)
+                .min()
+        };
         let Some(pick) = feeds
             .iter()
             .enumerate()
@@ -1275,6 +2194,9 @@ mod tests {
             fade_in: 0.0,
             fade_out: 0.0,
             filter_chain: String::new(),
+            vst3_effects: Vec::new(),
+            automation_start: 0.0,
+            automation_span: 1.0,
         }
     }
 
@@ -1609,6 +2531,9 @@ mod tests {
             fade_in: 0.0,
             fade_out: 0.0,
             filter_chain: String::new(),
+            vst3_effects: Vec::new(),
+            automation_start: 0.0,
+            automation_span: 1.0,
         };
         let clips = [piece(0.0, 0.0, 2.0), piece(2.0, 2.0, 4.0)];
         let target = output.clone();
@@ -1637,6 +2562,7 @@ mod tests {
             start,
             duration,
             filter_chain: chain.to_owned(),
+            vst3_effects: Vec::new(),
             strength: 1.0,
             fade_in: 0.0,
             fade_out: 0.0,
@@ -1680,6 +2606,17 @@ mod tests {
                 plain
             );
         }
+    }
+
+    #[test]
+    fn a_vst3_only_bus_is_audible_but_a_bypassed_one_is_not() {
+        let mut bus = bus(0.0, 1.0, "");
+        bus.vst3_effects.push(concat_project::model::Vst3Effect::new(
+            "0123456789abcdef0123456789abcdef",
+        ));
+        assert!(bus.audible());
+        bus.vst3_effects[0].enabled = false;
+        assert!(!bus.audible());
     }
 
     #[test]

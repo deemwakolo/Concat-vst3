@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
+
+[package]
+name = "concat-vst3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native VST3 audio-effect host: plugin discovery, lifecycle, and block processing through a C++ SDK bridge exposed over a C ABI."
+
+# concat-core is the only dependency: concat-vst3 must stay headless and
+# testable. It knows nothing about FFmpeg, the timeline, or the UI.
+[dependencies]
+concat-core.workspace = true
+thiserror.workspace = true
+serde = { version = "1", features = ["derive"] }
+log = "0.4"
+
+# The C++ host bridge is compiled by build.rs and linked natively. `cc` is a
+# build-only dependency: it drives the C++ compiler, it is not shipped.
+[build-dependencies]
+cc = "1"
+
+[features]
+# Enable the native VST3 bridge. Off by default: the workspace builds without
+# the VST3 SDK or a C++ compiler, so `concat-vst3` compiles to a stub that
+# reports every plugin as unavailable. Turn on when VST3_SDK_DIR points at an
+# unpacked Steinberg VST3 SDK and a C++ compiler is available.
+native = []
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

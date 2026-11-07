@@ -346,6 +346,9 @@ mod tests {
             fade_in: 0.0,
             fade_out: 0.0,
             filter_chain: String::new(),
+            vst3_effects: Vec::new(),
+            automation_start: 0.0,
+            automation_span: 1.0,
         };
         super::super::mix_to_file(&[clip], 6.0, &m4a).expect("mixes");
 
