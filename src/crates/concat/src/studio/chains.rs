@@ -217,7 +217,7 @@ impl Studio {
                     };
                     let mut effects = clip.vst3_effects.clone();
                     let target = (row as i32 + delta) as i32;
-                    if row < effects.len() && target >= 0 && target as usize < effects.len() {
+                    if row < effects.len() && target >= 0 && (target as usize) < effects.len() {
                         effects.swap(row, target as usize);
                         commands.push(Command::UpdateClip {
                             clip_id: clip_id.clone(),

@@ -1590,7 +1590,7 @@ impl Studio {
                 for desc in vst3_catalogue() {
                     entries.push(CatalogueEntryData {
                         id: vst3_id(&desc.class_id).into(),
-                        name: desc.name.into(),
+                        name: desc.name.clone().into(),
                         category: "VST3".into(),
                         group,
                         description: format!("{} · {}", desc.vendor, desc.name).into(),
