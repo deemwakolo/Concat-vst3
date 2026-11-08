@@ -927,7 +927,7 @@ jobs:
           # the program. Beside concat.exe Windows finds the DLLs and
           # concat-speech's `cpu_backend` the modules.
           if ("${{ matrix.ggml }}" -eq "variants") {
-            $built = Get-ChildItem "src\target\${{ matrix.target }}\app\build\whisper-rs-sys-*\out\bin\ggml-cpu-x64.dll" |
+            $built = Get-ChildItem "src\target\${{ matrix.target }}\app\build\whisper-rs-sys-*\out\build\bin\ggml-cpu-x64.dll" |
               Sort-Object LastWriteTime -Descending | Select-Object -First 1
             if (-not $built) { throw "whisper-rs-sys installed no ggml-cpu-x64.dll" }
             Write-Host "whisper's build: $($built.DirectoryName)"
