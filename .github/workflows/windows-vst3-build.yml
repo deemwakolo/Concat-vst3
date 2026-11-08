@@ -122,8 +122,26 @@ jobs:
 
       - name: Build entire workspace
         working-directory: src
-        shell: bash
-        run: cargo build --workspace --all-targets --locked
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe was not found"
+          }
+          $installPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $installPath) {
+            throw "Visual Studio with the MSVC x64 toolchain is not installed"
+          }
+          $vsDevCmd = Join-Path $installPath "Common7\Tools\VsDevCmd.bat"
+          if (-not (Test-Path $vsDevCmd)) {
+            throw "VsDevCmd.bat was not found"
+          }
+          $command = "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 && cargo build --workspace --all-targets --locked"
+          & cmd.exe /d /s /c $command
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo build failed with exit code $LASTEXITCODE"
+          }
 
       - name: Upload Windows build
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
