@@ -138,9 +138,22 @@ jobs:
             throw "VsDevCmd.bat was not found"
           }
           $command = "call `"$vsDevCmd`" -arch=x64 -host_arch=x64 && cargo build --workspace --all-targets --locked"
-          & cmd.exe /d /s /c $command
-          if ($LASTEXITCODE -ne 0) {
-            throw "cargo build failed with exit code $LASTEXITCODE"
+          # Skia's prebuilt Windows binaries are fetched from GitHub Releases
+          # during the build; a transient HTTP 504 there must not force a full
+          # from-source Skia build, so retry the build a few times first.
+          $maxAttempts = 3
+          $attempt = 0
+          while ($attempt -lt $maxAttempts) {
+            $attempt++
+            Write-Host "Build attempt $attempt of $maxAttempts"
+            & cmd.exe /d /s /c $command
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -lt $maxAttempts) {
+              Write-Host "Build failed with exit code $LASTEXITCODE; retrying in 60 seconds"
+              Start-Sleep -Seconds 60
+            } else {
+              throw "cargo build failed with exit code $LASTEXITCODE after $maxAttempts attempts"
+            }
           }
 
       - name: Upload Windows build
