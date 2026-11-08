@@ -433,6 +433,15 @@ mod tests {
 
     /// The probe reads what a file's tags say its picture is: HLG, PQ, or
     /// SDR where it is BT.709 - the fact a timeline turns HDR by.
+    ///
+    /// The SDR picture is written in the codec Concat's own working copies
+    /// use (`VideoCodec::WORKING`): the question here is the probe's tags,
+    /// so the fixture takes the encoder every FFmpeg build carries rather
+    /// than one of the platform's Media Foundation lanes, whose absence
+    /// turned this test into a codec question it does not ask. The HDR
+    /// pictures are ten bits, the one lane this crate writes them in - HEVC
+    /// - and keep it: where no ten-bit HEVC encoder actually encodes, they
+    /// are skipped and said so, not pressed into a file it cannot make.
     #[test]
     fn the_probe_reads_a_files_hdr_tags() {
         use crate::encode::{EncodeOptions, Encoder, FrameSink, RateMode, VideoCodec};
@@ -440,24 +449,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("concat-probe-hdr-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a scratch folder");
-        let options = EncodeOptions {
-            codec: VideoCodec::Hevc,
-            preset: "ultrafast".to_owned(),
-            crf: 28,
-            rate_mode: RateMode::Vbr,
-            bitrate_kbps: 0,
-            ten_bit: false,
-            color_range: crate::ColorRange::Limited,
-            hardware: false,
-            threads: 0,
-            software_only: false,
-        };
         let rate = FrameRate::from_int(25);
         for (name, hdr, want) in [
             ("sdr.mp4", None, Signal::Sdr),
             ("hlg.mp4", Some(false), Signal::Hlg),
             ("pq.mp4", Some(true), Signal::Pq),
         ] {
+            let codec = if hdr.is_some() {
+                VideoCodec::Hevc
+            } else {
+                VideoCodec::WORKING
+            };
+            let options = EncodeOptions {
+                codec,
+                preset: "ultrafast".to_owned(),
+                crf: 28,
+                rate_mode: RateMode::Vbr,
+                bitrate_kbps: 0,
+                ten_bit: false,
+                color_range: crate::ColorRange::Limited,
+                hardware: false,
+                threads: 0,
+                software_only: false,
+            };
             let path = dir.join(name);
             let encoder = match hdr {
                 None => Encoder::create(&path, 64, 64, rate, &options),
@@ -466,7 +480,7 @@ mod tests {
             let mut encoder = match encoder {
                 Ok(encoder) => encoder,
                 Err(error) if hdr.is_some() && VideoCodec::Hevc.ten_bit_only_on_hardware() => {
-                    eprintln!("{name}: no ten-bit HEVC encoder opens here ({error}); skipped");
+                    eprintln!("{name}: no ten-bit HEVC encoder encodes here ({error}); skipped");
                     continue;
                 }
                 Err(error) => panic!("{name} encodes: {error}"),

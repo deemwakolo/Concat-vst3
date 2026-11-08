@@ -1629,7 +1629,7 @@ impl ReaderPool {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::encode::{EncodeOptions, Encoder, FrameSink};
+    use crate::encode::{EncodeOptions, Encoder, FrameSink, VideoCodec};
 
     #[test]
     fn the_access_policy_rolls_forward_and_seeks_backward() {
@@ -1800,17 +1800,24 @@ pub(crate) mod tests {
     /// A short video whose frames are identifiable by colour: the red
     /// channel encodes the frame index (x2 to survive compression
     /// rounding).
+    ///
+    /// The fixture is written in the codec Concat's own working copies use
+    /// (`VideoCodec::WORKING`), for the same reason a proxy is: every FFmpeg
+    /// build carries MPEG-4's encoder, it loads no driver and asks no
+    /// platform for a lane, and a test that draws H.264 out of Media
+    /// Foundation on Windows collapses on a machine where the installed
+    /// encoder is in the registry but answers its first frame with an
+    /// error. The frames' own colours are what these tests read back, and
+    /// MPEG-4's lossy rounding is well inside the ±8 the assertions allow.
     pub(crate) fn counting_video(name: &str, size: u32, frames: u32) -> PathBuf {
         let path =
             std::env::temp_dir().join(format!("concat-pool-{name}-{}.mp4", std::process::id()));
-        let mut encoder = Encoder::create(
-            &path,
-            size,
-            size,
-            FrameRate::THIRTY,
-            &EncodeOptions::default(),
-        )
-        .expect("the linked FFmpeg encodes h264");
+        let options = EncodeOptions {
+            codec: VideoCodec::WORKING,
+            ..EncodeOptions::default()
+        };
+        let mut encoder = Encoder::create(&path, size, size, FrameRate::THIRTY, &options)
+            .expect("a usable encoder was available");
         for index in 0..frames {
             let mut frame = Frame::black(size, size);
             frame.fill([(index * 2).min(255) as u8, 40, 40, 255]);

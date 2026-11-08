@@ -357,12 +357,12 @@ pub fn with_sound_layers(
                     clips,
                     layers: over,
                 }),
-                // Sound-layer VST3 effects are applied after the native mix;
-                // preserve them here so the cache key and downstream processing
-                // can use them. The actual real-time processing happens in the
-                // monitor path; for cached PCM the effects are baked in during
-                // export (see `render_vst3_clip` and `prepare_vst3_buses`).
-                vst3_effects: layer.vst3_effects.clone(),
+                // Sound-layer VST3 effects are kept on the layers in
+                // `bus.layers` (see `BusSpec::vst3_effects`), where the mix
+                // and the cache key read them; this span has no layer-level
+                // effects of its own, since the mix already bakes them into
+                // the cached PCM (see `render_vst3_clip`).
+                vst3_effects: Vec::new(),
                 automation_start: 0.0,
                 automation_span: 1.0,
             }
@@ -2310,7 +2310,7 @@ mod tests {
 
     #[test]
     fn vst3_configuration_changes_the_processed_audio_cache_key() {
-        let mut spec = super::tone_spec(std::path::Path::new("tone.wav"), 0.0, 1.0);
+        let mut spec = tone_spec(std::path::Path::new("tone.wav"), 0.0, 1.0);
         let original = super::decode_key(&spec);
         let mut first = concat_project::model::Vst3Effect::new("0123456789abcdef0123456789abcdef");
         first.params.insert("Gain".to_owned(), 0.5);
@@ -2339,7 +2339,7 @@ mod tests {
 
     #[test]
     fn sound_layer_state_changes_the_mixed_audio_cache_key() {
-        let mut spec = super::tone_spec(std::path::Path::new("tone.wav"), 0.0, 1.0);
+        let mut spec = tone_spec(std::path::Path::new("tone.wav"), 0.0, 1.0);
         let mut effect =
             concat_project::model::Vst3Effect::new("0123456789abcdef0123456789abcdef");
         effect.state = Some(vec![1]);
@@ -2362,7 +2362,7 @@ mod tests {
 
     #[test]
     fn vst3_automation_coordinates_remain_clip_relative_for_split_pieces() {
-        let mut piece = super::tone_spec(std::path::Path::new("tone.wav"), 1.0, 0.5);
+        let mut piece = tone_spec(std::path::Path::new("tone.wav"), 1.0, 0.5);
         piece.automation_start = 0.25;
         piece.automation_span = 0.25;
         assert_eq!(piece.automation_at(0.0), 0.25);

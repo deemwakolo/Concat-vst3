@@ -2438,7 +2438,7 @@ mod tests {
     /// file with a quarter of the picture unwritten.
     #[test]
     fn the_mux_keeps_the_whole_picture_when_its_packets_come_denser_than_the_sound() {
-        use crate::{EncodeOptions, Encoder, FrameSink};
+        use crate::{EncodeOptions, Encoder, FrameSink, VideoCodec};
         use concat_core::frame::Frame;
         use concat_core::time::FrameRate;
 
@@ -2450,11 +2450,14 @@ mod tests {
         // Four seconds: 240 picture packets against about 190 of sound.
         let frames = 240;
         let options = EncodeOptions {
+            // A fixture's codec is not the question the test asks (see
+            // `VideoCodec::WORKING`): the packets' density is.
+            codec: VideoCodec::WORKING,
             preset: "ultrafast".to_owned(),
             ..EncodeOptions::default()
         };
         let mut encoder = Encoder::create(&video, 64, 64, FrameRate::SIXTY, &options)
-            .expect("the linked FFmpeg encodes h264");
+            .expect("a usable encoder was available");
         let frame = Frame::black(64, 64);
         for _ in 0..frames {
             encoder.write_frame(&frame).expect("writes");

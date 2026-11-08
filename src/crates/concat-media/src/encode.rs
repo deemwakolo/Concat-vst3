@@ -693,8 +693,17 @@ fn leads_with_hardware(
     false
 }
 
-/// Whether `encoder_name` opens for an eight-bit 720p30 file of `codec`:
+/// Whether `encoder_name` proves it can actually encode a file of `codec`:
 /// the question a phone's chip answers only by being asked.
+///
+/// Opening a context proves mere availability. A codec that asks the GPU for
+/// a context, or Media Foundation for a lane, can satisfy this and still
+/// die a few lines later when a frame is actually submitted: the test suite
+/// records those files as encodable, then fails the test one write later.
+/// So the ask is completed honestly: one black 720p30 frame goes in over
+/// each way an export would ask, the packet comes out, the drain is asked
+/// for, and a stalled answer is not taken for one. The same question, at
+/// working size, is what [`encodable_among`] uses.
 fn opens(codec: VideoCodec, encoder_name: &'static str) -> bool {
     let Some(found) = encoder::find_by_name(encoder_name) else {
         return false;
@@ -708,23 +717,103 @@ fn opens(codec: VideoCodec, encoder_name: &'static str) -> bool {
         ffmpeg::color::TransferCharacteristic::BT709,
         ffmpeg::color::Space::BT709,
     );
-    // Nothing is written: the path only names the file in an error.
-    let result = open_video(
-        encoder_name,
-        found,
-        Path::new("probe.mp4"),
-        (1280, 720),
-        ffmpeg::Rational::new(30, 1),
-        &options,
-        tags,
-        None,
-        true,
-        Attempt::AsAsked,
-    );
-    if let Err(error) = &result {
-        log::info!("{encoder_name} does not open here: {error}");
+    // The same ways an export asks, in order: an ask that only opens one
+    // way would record the encoder as a non-answer where the export itself
+    // would have gone on to ask it plainly (a phone's chip, a Mac's).
+    for attempt in attempts(encoder_name) {
+        // Nothing is written: the path only names the file in an error.
+        let (encoder, pixel_format) = match open_video(
+            encoder_name,
+            found,
+            Path::new("probe.mp4"),
+            (1280, 720),
+            ffmpeg::Rational::new(30, 1),
+            &options,
+            tags,
+            None,
+            true,
+            *attempt,
+        ) {
+            Ok((encoder, pixel_format)) => (encoder, pixel_format),
+            Err(error) => {
+                log::info!("{encoder_name} does not open {attempt:?} here: {error}");
+                continue;
+            }
+        };
+        if encodes_one_frame(encoder, pixel_format) {
+            return true;
+        }
     }
-    result.is_ok()
+    false
+}
+
+/// Whether `encoder` makes a packet out of one black frame and then the end
+/// of the stream, over the pixel format `open_video` told us it takes.
+///
+/// An opened context sees the encoder only so far: an asynchronous MFT, or
+/// a chip whose session dies a frame in, opens cleanly and dies on the
+/// first picture. The honest answer comes out of `receive_packet`, not the
+/// opening.
+fn encodes_one_frame(mut encoder: encoder::video::Encoder, pixel_format: Pixel) -> bool {
+    let mut probe = Video::new(pixel_format, 1280, 720);
+    // `Video::new` hands an allocated picture that the codec may be handed
+    // at once - a black one, the cheapest frame a chip is asked to make.
+    for plane in 0..probe.planes() {
+        probe.data_mut(plane).fill(0);
+    }
+    probe.set_pts(Some(0));
+
+    // The send-and-receive contract: whenever `encoder` says "try again",
+    // it is read out and the same ask returns - a frame on one side of the
+    // queue until it is taken, then the end of the stream. One frame and
+    // its drain is milliseconds' work; a second is a stall.
+    let mut packet = ffmpeg::Packet::empty();
+    let mut stage = Stage::Frame;
+    let mut packets = 0;
+    let started = std::time::Instant::now();
+    loop {
+        match stage {
+            Stage::Frame => match encoder.send_frame(&probe) {
+                Ok(()) => stage = Stage::End,
+                Err(error) if ffi::is_again(&error) => {}
+                Err(_) => return false,
+            },
+            Stage::End => match encoder.send_eof() {
+                Ok(()) => stage = Stage::Drain,
+                Err(error) if ffi::is_again(&error) => {}
+                Err(_) => return false,
+            },
+            Stage::Drain => {}
+        }
+        match encoder.receive_packet(&mut packet) {
+            Ok(()) => packets += 1,
+            Err(ffmpeg::Error::Eof) => return packets > 0,
+            Err(error) if ffi::is_again(&error) => {}
+            Err(_) => return false,
+        }
+        if started.elapsed() >= PROBE_PATIENCE {
+            // One packet provably means the encoder worked; the rest of a
+            // queue that never empties is not a capability question.
+            return packets > 0;
+        }
+        std::thread::sleep(ENCODER_WAIT);
+    }
+}
+
+/// How long the honest ask may keep an encoder before it is called stuck:
+/// one frame at 720p30 goes in and comes out in milliseconds; a second of
+/// silence is a stall, and a truth about the machine rather than a slip.
+const PROBE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// What an encoder is still owed in the honest ask: the frame, then the
+/// end of the stream, then its last answers read out.
+enum Stage {
+    /// The frame itself.
+    Frame,
+    /// The end of the stream.
+    End,
+    /// Everything left, until `receive_packet` says the last is out.
+    Drain,
 }
 
 /// Whether each hardware encoder opens here, as a probe found or an export
@@ -1593,11 +1682,14 @@ impl Encoder {
         // Every encoder the linked FFmpeg has for the codec, best first,
         // and among them the first that opens. Being linked is not being
         // able: a phone's FFmpeg carries MediaCodec's encoders for every
-        // codec, and the chip it runs on has a few of them.
+        // codec, and the chip it runs on has a few of them. A listing that
+        // survives this probe reaches the muxer as a working export; one
+        // that dies here stands in the list for the one that does not.
         let candidates: Vec<(&'static str, ffmpeg::Codec)> = options
             .codec
             .linked(options.hardware, options.ten_bit)
             .filter_map(|name| encoder::find_by_name(name).map(|codec| (name, codec)))
+            .filter(|candidate| opens_here(options.codec, candidate.0))
             .collect();
         if candidates.is_empty() {
             return Err(Error::Missing {
@@ -1784,6 +1876,8 @@ impl Encoder {
         converted.set_pts(Some(self.written as i64));
         // The frame says what its numbers span, the same as the stream
         // does: a hardware encoder reads it off the frame.
+        converted.set_width(self.width);
+        converted.set_height(self.height);
         // SAFETY: `converted` is a live frame, its picture filled in; the
         // range is a plain field the encoder reads with the picture.
         unsafe {
@@ -2442,6 +2536,10 @@ mod tests {
         const FRAMES: u32 = 60;
         let seconds = f64::from(FRAMES) / 30.0;
         for codec in [VideoCodec::H264, VideoCodec::Hevc] {
+            if !codec.encodable() {
+                eprintln!("no {} encoder here; skipped", codec.label());
+                continue;
+            }
             let options = EncodeOptions {
                 codec,
                 preset: "ultrafast".to_owned(),
@@ -2498,7 +2596,7 @@ mod tests {
         let path = dir.join("150-at-25fps.mp4");
 
         let options = EncodeOptions {
-            codec: VideoCodec::H264,
+            codec: VideoCodec::WORKING,
             preset: "ultrafast".to_owned(),
             crf: 16,
             rate_mode: RateMode::Vbr,
@@ -3096,19 +3194,35 @@ mod tests {
             .into_iter()
             .filter(|codec| !codec.keeps_alpha())
         {
-            if !codec.available() {
-                eprintln!("{} not in the linked FFmpeg; skipped", codec.label());
+            // An encoder in the registry is not an encoder that encodes:
+            // ask what `encodable` proves (one frame honestly encoded), and
+            // skip where no linked encoder answers.
+            if !codec.encodable() {
+                eprintln!(
+                    "no {} encoder here that actually encodes; skipped",
+                    codec.label()
+                );
                 continue;
             }
             for ten_bit in [false, true] {
+                // ProRes is ten bits whatever is asked (see `settled`):
+                // there is no eight-bit ask to answer, and the deep check
+                // below would call the file a lie when it is not one.
+                if !ten_bit && codec == VideoCodec::ProRes4444 {
+                    eprintln!("{} is always ten bits; skipped", codec.label());
+                    continue;
+                }
                 if ten_bit && !codec.ten_bit_available() {
                     eprintln!("{} has no ten-bit encoder here; skipped", codec.label());
                     continue;
                 }
+                // The codec's own container: MP4 has no place for ProRes'
+                // QuickTime stream (`VideoCodec::container`).
                 let path = std::env::temp_dir().join(format!(
-                    "concat-encode-{}-{}.mp4",
+                    "concat-encode-{}-{}.{}",
                     codec.name(),
-                    ten_bit
+                    ten_bit,
+                    codec.container()
                 ));
                 let options = EncodeOptions {
                     codec,
@@ -3140,12 +3254,27 @@ mod tests {
 
                 let (name, tag, primaries, transfer, space, format, range) = tags_of(&path);
                 let _ = std::fs::remove_file(&path);
-                assert_eq!(name, codec.name(), "the stream's codec");
+                // The stream's codec is named by the standard FFmpeg knows
+                // it by, which for ProRes is `prores`, not the document
+                // name `prores-4444` (`VideoCodec::name`) the request
+                // carried.
+                let standard = match codec {
+                    VideoCodec::ProRes4444 => "prores",
+                    other => other.name(),
+                };
+                assert_eq!(name, standard, "the stream's codec");
                 assert_eq!(primaries, ffmpeg::color::Primaries::BT709);
                 assert_eq!(transfer, ffmpeg::color::TransferCharacteristic::BT709);
                 assert_eq!(space, ffmpeg::color::Space::BT709);
                 assert_eq!(range, ffmpeg::color::Range::MPEG, "video range by default");
-                let deep = matches!(format, Pixel::YUV420P10LE | Pixel::P010LE);
+                // Ten bits can arrive in the 4:2:0 HDR layouts or, for the
+                // alpha codecs (ProRes here), in the alpha codec's own
+                // 4:4:4-with-alpha one; both are ten bits a channel, and
+                // the check is the channel count of what was written.
+                let deep = matches!(
+                    format,
+                    Pixel::YUV420P10LE | Pixel::P010LE | Pixel::YUVA444P10LE
+                );
                 assert_eq!(deep, ten_bit, "{} bit depth ({format:?})", codec.label());
                 if codec == VideoCodec::Hevc {
                     assert_eq!(tag, fourcc(*b"hvc1"), "HEVC in MP4 is tagged hvc1");
@@ -3302,6 +3431,9 @@ mod tests {
             let path =
                 std::env::temp_dir().join(format!("concat-encode-range-{}.mp4", range.name()));
             let options = EncodeOptions {
+                // Levels and tags are the question, not the codec (see
+                // `VideoCodec::WORKING`).
+                codec: VideoCodec::WORKING,
                 preset: "ultrafast".to_owned(),
                 // Near-lossless, so a level is a level and not a quantiser's
                 // guess at one; software, so the numbers are swscale's own.
@@ -3311,7 +3443,7 @@ mod tests {
                 ..EncodeOptions::default()
             };
             let mut encoder = Encoder::create(&path, 64, 64, FrameRate::THIRTY, &options)
-                .expect("the linked FFmpeg encodes h264");
+                .expect("a usable encoder was available");
             for grey in GREYS {
                 let mut frame = Frame::black(64, 64);
                 frame.fill([grey, grey, grey, 255]);
@@ -3358,9 +3490,19 @@ mod tests {
     #[test]
     fn a_wrong_sized_frame_is_rejected() {
         let path = std::env::temp_dir().join("concat-encode-size-test.mp4");
-        let mut encoder =
-            Encoder::create(&path, 64, 64, FrameRate::THIRTY, &EncodeOptions::default())
-                .expect("the linked FFmpeg encodes h264");
+        let mut encoder = Encoder::create(
+            &path,
+            64,
+            64,
+            FrameRate::THIRTY,
+            &EncodeOptions {
+                // A fixture's codec is not the question the test asks (see
+                // `VideoCodec::WORKING`).
+                codec: VideoCodec::WORKING,
+                ..EncodeOptions::default()
+            },
+        )
+        .expect("a usable encoder was available");
 
         let wrong = Frame::black(32, 32);
         assert!(matches!(
