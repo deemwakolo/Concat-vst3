@@ -690,7 +690,7 @@ jobs:
           # profile. In lib/ the rpath finds the libraries and
           # concat-speech's `cpu_backend` the modules.
           if [ "${{ matrix.ggml }}" = variants ]; then
-            out=$(ls -dt "src/target/${{ matrix.target }}/app/build"/whisper-rs-sys-*/out/bin | head -1)
+            out=$(ls -dt "src/target/${{ matrix.target }}/app/build"/whisper-rs-sys-*/out/build/bin | head -1)
             out=${out%/bin}
             echo "whisper's build: $out"
             cp -a "$out"/lib*/libwhisper.so* "$out"/lib*/libggml*.so* "$out"/bin/libggml-cpu-*.so "stage/$name/lib/"
