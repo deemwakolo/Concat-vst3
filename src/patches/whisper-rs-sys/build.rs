@@ -172,6 +172,10 @@ fn main() {
             .clang_arg("-I./whisper.cpp/include")
             .clang_arg("-I./whisper.cpp/ggml/include")
             .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+            .blocklist_function("ggml_cpu_has_avx")
+            .blocklist_function("ggml_cpu_has_avx2")
+            .blocklist_function("ggml_cpu_has_fma")
+            .blocklist_function("ggml_cpu_has_f16c")
             .generate();
 
         match bindings {
