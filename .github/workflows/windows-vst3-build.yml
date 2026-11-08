@@ -1,0 +1,133 @@
+﻿name: Windows VST3 Build
+
+on:
+  push:
+    branches:
+      - feature/vst3-integration
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build full workspace with native VST3
+    runs-on: windows-2022
+    timeout-minutes: 150
+
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_BUILD_JOBS: "2"
+      ORT_VERSION: "1.28.0"
+      GGML_NATIVE: "OFF"
+      GGML_BACKEND_DL: "ON"
+      GGML_CPU_ALL_VARIANTS: "ON"
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "1.93.1"
+          components: clippy, rustfmt
+
+      - name: Checkout Steinberg VST3 SDK
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: steinbergmedia/vst3sdk
+          ref: 3cdf9ca5d1f5b1b21e0a86832aa4abe55607bd96
+          path: vst3sdk
+          submodules: recursive
+
+      - name: Configure VST3 SDK path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE\vst3sdk\pluginterfaces")) {
+            throw "VST3 SDK pluginterfaces directory is missing"
+          }
+          "VST3_SDK_DIR=$env:GITHUB_WORKSPACE\vst3sdk" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Install LLVM and libclang
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/fetch.sh llvm-win64 llvm.exe
+          if ($LASTEXITCODE -ne 0) { throw "LLVM download failed" }
+
+          Start-Process -Wait -FilePath .\llvm.exe -ArgumentList "/S", "/D=C:\llvm"
+
+          if (-not (Test-Path "C:\llvm\bin\libclang.dll")) {
+            throw "libclang was not installed"
+          }
+
+          "C:\llvm\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "LIBCLANG_PATH=C:\llvm\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Remove-Item .\llvm.exe
+
+      - name: Install FFmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/fetch.sh ffmpeg-win64 ffmpeg-win.zip
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg download failed" }
+
+          Expand-Archive ffmpeg-win.zip -DestinationPath ffdl
+          $dir = (Get-ChildItem ffdl -Directory | Select-Object -First 1).FullName
+
+          if (-not (Test-Path "$dir\include")) {
+            throw "FFmpeg headers were not found"
+          }
+
+          "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Install ONNX Runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/fetch.sh onnxruntime-win-x64 onnxruntime.zip
+          if ($LASTEXITCODE -ne 0) { throw "ONNX Runtime download failed" }
+
+          Expand-Archive onnxruntime.zip -DestinationPath .
+          $lib = "$PWD\onnxruntime-win-x64-$env:ORT_VERSION\lib"
+
+          if (-not (Test-Path "$lib\onnxruntime.lib")) {
+            throw "ONNX Runtime import library is missing"
+          }
+
+          "ORT_LIB_LOCATION=$lib" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $lib | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: src
+          cache-on-failure: true
+
+      - name: Verify native build environment
+        shell: pwsh
+        run: |
+          cmake --version
+          cargo --version
+          if (-not (Test-Path "$env:VST3_SDK_DIR\pluginterfaces")) {
+            throw "VST3 SDK is unavailable"
+          }
+
+      - name: Build entire workspace
+        working-directory: src
+        shell: bash
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: concat-windows-vst3-build
+          path: src/target/debug/concat.exe
+          if-no-files-found: warn
